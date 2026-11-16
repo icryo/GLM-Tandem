@@ -1,0 +1,10 @@
+#!/bin/sh
+# oMLX's bundled Python with a locally built (patched) MLX first on the path.
+# MLX_BUILD: checkout of MLX built in place (see mlx/README.md). OMLX_APP: the oMLX application bundle.
+MLX_BUILD=${MLX_BUILD:-$HOME/mlxbuild/mlx}
+OMLX_APP=${OMLX_APP:-/Applications/oMLX.app}
+RES=$OMLX_APP/Contents/Resources
+export PYTHONHOME=$RES/Python/cpython-3.11
+export PYTHONPATH=$MLX_BUILD/python:$RES:$RES/Python/framework-mlx-base/lib/python3.11/site-packages
+export PYTHONDONTWRITEBYTECODE=1
+exec $RES/Python/cpython-3.11/bin/python3 "$@"

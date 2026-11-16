@@ -1,0 +1,351 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 493e8e3..92420ff 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -15,6 +15,68 @@
+ #include "mlx/backend/metal/metal.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/utils.h"
++#include <time.h>
++#include <algorithm>
++#include <cstdio>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++namespace mlx::core::metal {
++struct KGapRec { double commit, start, end; std::string label; };
++struct KGap {
++  bool on{std::getenv("MLX_KGAP") != nullptr};
++  std::mutex m;
++  std::vector<KGapRec> v;
++  std::string label;
++};
++static KGap& kgap() { static KGap k; return k; }
++static double kgap_now() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9; }
++bool kgap_on() { return kgap().on; }
++void kgap_label(const std::string& s) { auto& k = kgap(); if (k.label.empty()) k.label = s; }
++void kgap_reset() { auto& k = kgap(); std::lock_guard<std::mutex> lk(k.m); k.v.clear(); }
++void kgap_dump() {
++  auto& k = kgap(); std::lock_guard<std::mutex> lk(k.m);
++  auto v = k.v;
++  if (v.empty()) return;
++  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.start < b.start; });
++  struct B { double ms{0}; long n{0}; };
++  std::map<std::string, B> gaps, durs;
++  double busy = 0, idle = 0, host = 0, sched = 0, maxend = v[0].end; busy = v[0].end - v[0].start;
++  long hist[5] = {0, 0, 0, 0, 0};
++  for (size_t i = 1; i < v.size(); i++) {
++    auto& r = v[i];
++    double g = r.start - maxend;
++    if (g > 0) {
++      idle += g;
++      bool late = r.commit > maxend;
++      (late ? host : sched) += g;
++      auto& b = gaps[(late ? "HOST-LATE before " : "gpu-sched before ") + r.label]; b.ms += g * 1e3; b.n++;
++      hist[g < 10e-6 ? 0 : g < 50e-6 ? 1 : g < 200e-6 ? 2 : g < 1e-3 ? 3 : 4]++;
++      busy += r.end - r.start;
++    } else {
++      busy += std::max(0.0, r.end - std::max(maxend, r.start));
++    }
++    maxend = std::max(maxend, r.end);
++  }
++  for (auto& r : v) { auto& b = durs[r.label]; b.ms += (r.end - r.start) * 1e3; b.n++; }
++  const char* path = std::getenv("MLX_KGAP_FILE");
++  FILE* f = path ? std::fopen(path, "w") : stderr; if (!f) f = stderr;
++  double span = maxend - v[0].start;
++  std::fprintf(f, "KGAP buffers %zu span_ms %.2f busy_ms %.2f idle_ms %.2f (host-late %.2f, gpu-sched %.2f)\n",
++               v.size(), span * 1e3, busy * 1e3, idle * 1e3, host * 1e3, sched * 1e3);
++  std::fprintf(f, "KGAP gap histogram <10us %ld  10-50us %ld  50-200us %ld  0.2-1ms %ld  >1ms %ld\n", hist[0], hist[1], hist[2], hist[3], hist[4]);
++  std::vector<std::pair<std::string, B>> gv(gaps.begin(), gaps.end()), dv(durs.begin(), durs.end());
++  std::sort(gv.begin(), gv.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
++  std::sort(dv.begin(), dv.end(), [](auto& a, auto& b) { return a.second.ms > b.second.ms; });
++  for (size_t i = 0; i < gv.size() && i < 25; i++)
++    std::fprintf(f, "KGAP gap %9.2f ms %7ld x %7.1f us  %s\n", gv[i].second.ms, gv[i].second.n, gv[i].second.ms * 1e3 / gv[i].second.n, gv[i].first.c_str());
++  for (size_t i = 0; i < dv.size() && i < 25; i++)
++    std::fprintf(f, "KGAP buf %9.2f ms %7ld x %7.1f us  first=%s\n", dv[i].second.ms, dv[i].second.n, dv[i].second.ms * 1e3 / dv[i].second.n, dv[i].first.c_str());
++  if (f != stderr) std::fclose(f);
++}
++} // namespace mlx::core::metal
+ 
+ namespace std {
+ 
+@@ -457,6 +519,8 @@ void CommandEncoder::end_encoding(bool wait_in_flight) {
+   if (!encoder_) {
+     return;
+   }
++  wait_in_flight = wait_in_flight || pending_wait_in_flight_;
++  pending_wait_in_flight_ = false;
+ 
+   // Remove temporaries from inputs and outputs.
+   for (auto& t : temporaries_) {
+@@ -543,6 +607,14 @@ void CommandEncoder::commit(std::function<void()> completion) {
+   // Metal locks a command buffer's residency at commit time, so attach any
+   // sets created since the last commit first.
+   residency_sets_.attach_new_sets(queue_.get(), sets_attached_);
++  if (kgap().on) {
++    double tc = kgap_now();
++    buffer_->addCompletedHandler([tc, label = std::move(kgap().label)](MTL::CommandBuffer* c) {
++      auto& k = kgap(); std::lock_guard<std::mutex> lk(k.m);
++      k.v.push_back({tc, c->GPUStartTime(), c->GPUEndTime(), label});
++    });
++    kgap().label.clear();
++  }
+   buffer_->addCompletedHandler(
+       [&error_ = error_,
+        wait_events = std::move(wait_events_),
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+index 305a35a..0a3d733 100644
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -95,6 +95,9 @@ class MLX_API CommandEncoder {
+ 
+   void barrier();
+   void end_encoding(bool wait_in_flight = false);
++  // The current encoder contains a spin wait: when it ends it must wait for
++  // every encoder still in flight, as a dedicated spin-wait encoder does.
++  void mark_wait_in_flight() { pending_wait_in_flight_ = true; }
+   void wait_event(Event event, uint64_t value);
+   void signal_event(Event event, uint64_t value);
+   bool needs_commit() const;
+@@ -110,6 +113,7 @@ class MLX_API CommandEncoder {
+ 
+   Device& device_;
+   bool exiting_{false};
++  bool pending_wait_in_flight_{false};
+ 
+   // Buffer that stores encoded commands.
+   NS::SharedPtr<MTL::CommandQueue> queue_;
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+index 43a6fb9..1b695bb 100644
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -7,6 +7,47 @@
+ #include "mlx/primitives.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/utils.h"
++#include "mlx/fast_primitives.h"
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++#include <algorithm>
++
++// --- per-kernel GPU time profiler (MLX_KPROF=1): one command buffer per primitive -------------
++namespace mlx::core::metal {
++bool kgap_on(); void kgap_label(const std::string&); void kgap_reset(); void kgap_dump();
++}
++namespace {
++struct KProf {
++  bool on{std::getenv("MLX_KPROF") != nullptr};
++  std::mutex m;
++  std::unordered_map<std::string, std::pair<double, long>> t;
++  void add(const std::string& k, double sec) {
++    std::lock_guard<std::mutex> lk(m);
++    auto& e = t[k]; e.first += sec; e.second += 1;
++  }
++  void reset() { std::lock_guard<std::mutex> lk(m); t.clear(); }
++  void dump() {
++    std::lock_guard<std::mutex> lk(m);
++    std::vector<std::pair<std::string, std::pair<double, long>>> v(t.begin(), t.end());
++    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second.first > b.second.first; });
++    double tot = 0; long n = 0;
++    for (auto& e : v) { tot += e.second.first; n += e.second.second; }
++    const char* path = std::getenv("MLX_KPROF_FILE");
++    FILE* f = path ? std::fopen(path, "w") : stderr;
++    if (!f) f = stderr;
++    std::fprintf(f, "KPROF total_gpu_ms %.3f kernels %ld\n", tot * 1e3, n);
++    for (auto& e : v)
++      std::fprintf(f, "KPROF %10.3f ms %8ld calls %8.2f us/call  %s\n", e.second.first * 1e3,
++                   e.second.second, e.second.first * 1e6 / e.second.second, e.first.c_str());
++    if (f != stderr) std::fclose(f);
++  }
++};
++KProf& kprof() { static KProf k; return k; }
++} // namespace
+ 
+ namespace mlx::core::gpu {
+ 
+@@ -44,6 +85,30 @@ void eval(array& arr) {
+     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
+     arr.primitive().eval_gpu(arr.inputs(), outputs);
+   }
++  int kgap_action = 0;
++  if (metal::kgap_on()) {
++    std::string n = arr.primitive().name();
++    if (auto* ck = dynamic_cast<fast::CustomKernel*>(&arr.primitive())) {
++      n = "CK:" + std::get<0>(ck->state()).substr(0, 48);
++      if (n.find("kprof_reset") != std::string::npos) { kgap_action = 1; }
++      if (n.find("kprof_dump") != std::string::npos) { kgap_action = 2; }
++    }
++    metal::kgap_label(n);
++  }
++  std::string kname;
++  if (kprof().on) {
++    kname = arr.primitive().name();
++    if (auto* ck = dynamic_cast<fast::CustomKernel*>(&arr.primitive())) {
++      kname = "CK:" + std::get<0>(ck->state());
++      if (kname.find("kprof_reset") != std::string::npos) { kprof().reset(); }
++      if (kname.find("kprof_dump") != std::string::npos) { metal::get_command_encoder(s).synchronize(); kprof().dump(); }
++    } else {
++      // add a coarse size class from the largest input
++      size_t mx_in = 0;
++      for (auto& in : arr.inputs()) mx_in = std::max(mx_in, in.nbytes());
++      kname += mx_in >= (64u << 20) ? " [>=64MiB in]" : (mx_in >= (4u << 20) ? " [>=4MiB in]" : "");
++    }
++  }
+   std::unordered_set<std::shared_ptr<array::Data>> buffers;
+   for (auto& in : arr.inputs()) {
+     buffers.insert(in.data_shared_ptr());
+@@ -56,6 +121,19 @@ void eval(array& arr) {
+     buffers.erase(it);
+   }
+ 
++  if (kprof().on) {
++    // Isolate this primitive in its own command buffer and record its GPU execution time.
++    auto* cb = encoder.get_command_buffer();
++    cb->addCompletedHandler([kname](MTL::CommandBuffer* c) {
++      kprof().add(kname, c->GPUEndTime() - c->GPUStartTime());
++    });
++    encoder.end_encoding();
++    scheduler::notify_new_task(s);
++    encoder.commit([s, buffers = std::move(buffers)]() {
++      scheduler::notify_task_completion(s);
++    });
++    return;
++  }
+   if (encoder.needs_commit()) {
+     encoder.end_encoding();
+     scheduler::notify_new_task(s);
+@@ -66,6 +144,11 @@ void eval(array& arr) {
+     command_buffer->addCompletedHandler(
+         [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {});
+   }
++  if (kgap_action) {
++    // The marker kernel is encoded; drain the queue, then reset or report.
++    metal::get_command_encoder(s).synchronize();
++    if (kgap_action == 1) metal::kgap_reset(); else metal::kgap_dump();
++  }
+ }
+ 
+ void finalize(Stream s) {
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+index 819e2bb..feac2b4 100644
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -6,6 +6,13 @@
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/utils.h"
++#include <cstdlib>
++
++namespace {
++// Experiment switches: bit 1 = spin wait inside the current encoder (barriers instead of encoder
++// boundaries), bit 2 = no coherence kernel before the fence update.
++int fence_mode() { static int m = std::getenv("MLX_FENCE_MODE") ? std::atoi(std::getenv("MLX_FENCE_MODE")) : 0; return m; }
++}
+ 
+ namespace mlx::core {
+ 
+@@ -66,7 +73,12 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
+   auto& d = metal::device(stream.device);
+   auto& compute_encoder = metal::get_command_encoder(stream);
+ 
+-  compute_encoder.end_encoding();
++  const bool inline_wait = fence_mode() & 1;
++  if (inline_wait) {
++    compute_encoder.barrier();
++  } else {
++    compute_encoder.end_encoding();
++  }
+ 
+   // Register outputs to ensure that no kernels which depends on the
+   // output starts before this one is done
+@@ -79,7 +91,12 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
+   compute_encoder.set_buffer(f.buffer(), 0);
+   compute_encoder.set_bytes(value, 1);
+   compute_encoder.dispatch_threads(kernel_dims, kernel_dims);
+-  compute_encoder.end_encoding(true);
++  if (inline_wait) {
++    compute_encoder.barrier();
++    compute_encoder.mark_wait_in_flight();
++  } else {
++    compute_encoder.end_encoding(true);
++  }
+ 
+   compute_encoder.get_command_buffer()->addCompletedHandler(
+       [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
+@@ -106,8 +123,31 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
+   auto& d = metal::device(stream.device);
+   auto& compute_encoder = metal::get_command_encoder(stream);
+ 
++  if (cross_device && (fence_mode() & 4)) {
++    // Merged coherence + signal (see fence.metal) for inputs one threadgroup
++    // can cover; larger ones take the two-kernel path below.
++    uint32_t nthreads = (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) /
++        sizeof(uint32_t);
++    uint32_t per = (nthreads + 1024 - 1) / 1024;
++    if (per <= 64) {
++      compute_encoder.barrier();
++      auto kernel = d.get_kernel("input_coherent_update");
++      compute_encoder.set_compute_pipeline_state(kernel);
++      compute_encoder.set_input_array(x, 0);
++      compute_encoder.set_bytes(nthreads, 1);
++      compute_encoder.set_buffer(f.buffer(), 2);
++      compute_encoder.set_bytes(f.count, 3);
++      compute_encoder.set_bytes(per, 4);
++      compute_encoder.dispatch_threadgroups(
++          MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
++      compute_encoder.get_command_buffer()->addCompletedHandler(
++          [fence_ = fence_](MTL::CommandBuffer* cbuf) {});
++      return f.count;
++    }
++  }
++
+   // Launch input visibility kernels
+-  if (cross_device) {
++  if (cross_device && !(fence_mode() & 2)) {
+     auto kernel = d.get_kernel("input_coherent");
+     uint32_t nthreads = (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) /
+         sizeof(uint32_t);
+diff --git a/mlx/backend/metal/kernels/fence.metal b/mlx/backend/metal/kernels/fence.metal
+index cd5f901..e3027ad 100644
+--- a/mlx/backend/metal/kernels/fence.metal
++++ b/mlx/backend/metal/kernels/fence.metal
+@@ -50,3 +50,33 @@ constexpr constant metal::thread_scope thread_scope_system =
+     }
+   }
+ }
++
++// Coherence and signal in one dispatch: a single threadgroup makes the whole
++// input visible (each thread a few elements), then its first thread writes the
++// timestamp. No atomics: they are not available on coherent pointers.
++[[kernel]] void input_coherent_update(
++    volatile coherent(system) device uint* input [[buffer(0)]],
++    const constant uint& size [[buffer(1)]],
++    volatile coherent(system) device uint* timestamp [[buffer(2)]],
++    constant uint& value [[buffer(3)]],
++    const constant uint& per [[buffer(4)]],
++    uint lid [[thread_position_in_threadgroup]]) {
++  for (uint j = 0; j < per; j++) {
++    const uint i = lid * per + j;
++    if (i < size) {
++      input[i] = input[i];
++    }
++  }
++  metal::atomic_thread_fence(
++      metal::mem_flags::mem_device,
++      metal::memory_order_seq_cst,
++      metal::thread_scope_system);
++  threadgroup_barrier(metal::mem_flags::mem_device);
++  if (lid == 0) {
++    timestamp[0] = value;
++    metal::atomic_thread_fence(
++        metal::mem_flags::mem_device,
++        metal::memory_order_seq_cst,
++        metal::thread_scope_system);
++  }
++}
