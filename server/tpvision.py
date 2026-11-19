@@ -104,8 +104,13 @@ def install(S, model, model_path, rank):
                 return iter(())                       # "has images" no longer means "not batchable"
             return orig_parts(messages)
 
+        _VT = os.environ.get('TP_TRACE') == '1'; _MERGE = os.environ.get('TP_VISION_MERGE', '1') == '1'
         def _tokenize(self, tokenizer, request, args):
+            _t = [__import__('time').perf_counter()]
+            def _lap(nm):
+                if _VT: n = __import__('time').perf_counter(); print(f'[tp-vis] {nm} {1e3 * (n - _t[0]):.1f} ms', flush=True); _t[0] = n
             prompt, segments, types, state, vision = orig_tok(self, tokenizer, request, args)
+            _lap('template+processor')
             frame = sys._getframe(1)
             if vision is None or frame.f_code.co_name != "_generate":
                 return prompt, segments, types, state, vision
@@ -114,6 +119,9 @@ def install(S, model, model_path, rank):
             mkey = self.model_provider.model_key
             mdl = self.model_provider.model
             end = max(i for i, t in enumerate(prompt) if t == image_token_id) + 1
+            # One forward for the image AND the text after it (all but the last token): a second small
+            # forward for the text tail costs ~70 ms on its own (it sweeps most expert weights again).
+            if _MERGE: end = max(end, len(prompt) - 1)
             cache, rest = self.prompt_cache.fetch_nearest_cache(mkey, key[:end])
             done = end - len(rest)
             if rest:
@@ -124,7 +132,7 @@ def install(S, model, model_path, rank):
                     toks = mx.array(prompt[done:end])
                     n = sum(i < done for i in vision.starts)
                     emb = mdl.embed_inputs(toks, pixel_values=vision.pixel_values[n:])
-                    mx.eval(emb)
+                    mx.eval(emb); _lap('tower+embed')
                     trunk = mdl.language_model.model
                     for a in range(0, end - done, 1024):
                         b = min(a + 1024, end - done)
@@ -135,6 +143,7 @@ def install(S, model, model_path, rank):
                         prefill()
                 else:
                     prefill()
+                _lap('trunk prefill %d tok' % (end - done))
                 self.prompt_cache.insert_cache(mkey, key[:end], cache, cache_type="user")
             segs, o = [], 0
             for sg in segments:

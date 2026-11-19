@@ -1489,12 +1489,264 @@ if os.environ.get("TP_FASTSTEP", "1") == "1":
         G.GenerationBatch.next = _gb_next
         G.GenerationBatch.__len__ = lambda self: len(self.uids) + sum(len(b.uids) for b in getattr(self, "_deferred", ()))
 
+
+# ---- Prompt cache lookup without the quadratic search (TP_TRIE_FIX=1) --------------------------------
+# Stock PromptTrie.search also looks for a cached entry LONGER than the request (useful only for caches
+# that can be trimmed; this model's recurrent state cannot). It walks the tree building `extra + [tok]`
+# per node, which is quadratic in the entry length: 11-12 s of pure Python on the generation thread
+# whenever a new prompt shares its first tokens with a cached 100k-token conversation (every chat prompt
+# shares the opening template tokens), during which every active stream is frozen.
+if os.environ.get("TP_TRIE_FIX", "1") == "1":
+    from mlx_lm.models import cache as _MC
+    def _trie_search(self, model, tokens):
+        R = _MC.PromptTrieResult
+        if model not in self._trie: return R(model, None, None, None, 0)
+        cur = self._trie[model]
+        if not tokens and "__value__" in cur: return R(model, [], None, None, 0)
+        last = -1; i = 0; n = len(tokens)
+        while i < n and tokens[i] in cur:
+            cur = cur[tokens[i]]
+            if "__value__" in cur: last = i
+            i += 1
+        if last == n - 1 >= 0: return R(model, tokens, None, None, 0)
+        return R(model, None, tokens[:last + 1] if last > 0 else None, None, i)
+    _MC.PromptTrie.search = _trie_search
+
+# ---- Prompt cache policy (TP_CACHE_POLICY=1) -------------------------------------------------------
+# Stock: at most 10 entries, evicted oldest-first by insertion. A burst of short requests therefore
+# evicts a long conversation, whose next turn re-reads everything after the system prompt (seen in
+# real traffic: 205 turns at 60k+ tokens in four days, 30-60 s each). Here: short entries (< TP_CACHE_SMALL
+# tokens) live in their own tier capped by count; long entries are limited by bytes only (TP_CACHE_GB);
+# both tiers evict least-recently-USED (a fetch refreshes the entry). Same decisions on every rank.
+if os.environ.get("TP_CACHE_POLICY", "1") == "1":
+    _PC = S.LRUPromptCache
+    _C_SMALL = int(os.environ.get("TP_CACHE_SMALL", "8000")); _C_NSMALL = int(os.environ.get("TP_CACHE_NSMALL", "48"))
+    _C_BYTES = int(float(os.environ.get("TP_CACHE_GB", "40")) * 2**30)
+    class _Order:
+        def __init__(self, ordering=None):
+            self._ordering = ["assistant", "user", "system"]; self._items = []
+        def __len__(self): return len(self._items)
+        @property
+        def _lrus(self): return {k: [it for it in self._items if it[2] == k] for k in self._ordering}
+        def push(self, model, tokens, cache_type="assistant"): self._items.append((model, tokens, cache_type))
+        def _find(self, model, tokens):
+            n = len(tokens)
+            for i, it in enumerate(self._items):
+                if len(it[1]) == n and it[0] == model and it[1] == tokens: return i
+            return -1
+        def remove(self, model, tokens):
+            i = self._find(model, tokens)
+            if i >= 0: del self._items[i]
+        def touch(self, model, tokens):
+            i = self._find(model, tokens)
+            if i >= 0: self._items.append(self._items.pop(i))
+        def n_small(self): return sum(len(it[1]) < _C_SMALL for it in self._items)
+        def oldest(self, small):
+            for i, it in enumerate(self._items):
+                if small is None or (len(it[1]) < _C_SMALL) == small: return i
+            return -1
+        def pop(self, i=0):
+            it = self._items.pop(i); return it[0], it[1]
+    _PC.CacheOrder = _Order
+    _pc_init = _PC.__init__
+    def _pc_init2(self, max_size=10, max_bytes=1 << 63): _pc_init(self, 1 << 40, 1 << 63)
+    _PC.__init__ = _pc_init2
+    def _pc_drop(self, i):
+        model, tokens = self._lru.pop(i); e = self._trie.pop(model, tokens)
+        self._n_bytes -= e.nbytes; self._n_bytes_by_type[e.cache_type] -= e.nbytes
+    _pc_insert = _PC.insert_cache
+    def _pc_insert2(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        _pc_insert(self, model, tokens, prompt_cache, cache_type=cache_type)
+        o = self._lru
+        while o.n_small() > _C_NSMALL: _pc_drop(self, o.oldest(True))
+        while self._n_bytes > _C_BYTES and len(o) > 1:
+            i = o.oldest(False)
+            if i < 0 or i == len(o) - 1: i = 0          # no other long entry left: oldest of any kind
+            if i == len(o) - 1: break                    # never the entry just inserted
+            _pc_drop(self, i)
+    _PC.insert_cache = _pc_insert2
+    _pc_fetch = _PC.fetch_nearest_cache
+    def _pc_fetch2(self, model, tokens):
+        cache, rest = _pc_fetch(self, model, tokens)
+        if cache is not None: self._lru.touch(model, tokens[:len(tokens) - len(rest)])
+        return cache, rest
+    _PC.fetch_nearest_cache = _pc_fetch2
+    def _pc_trim_to(self, *, n_sequences=None, n_bytes=None): pass
+    _PC.trim_to = _pc_trim_to
+
+    # Stock _tokenize finds the end of the system prompt by the first token where "system + empty user
+    # message" differs from the real prompt. With this template there is often no difference (the short
+    # form is a clean prefix), so no system checkpoint is saved and a new conversation with the same
+    # system prompt re-reads all of it. Use the common prefix in that case.
+    _RG = next(c for c in vars(S).values() if isinstance(c, type) and "_tokenize" in vars(c) and "_generate" in vars(c))
+    _rg_tok = _RG._tokenize
+    _SYS_MIN = int(os.environ.get("TP_SYS_CKPT_MIN", "512"))
+    def _rg_tok2(self, tokenizer, request, args):
+        out = _rg_tok(self, tokenizer, request, args)
+        try:
+            prompt, segments, types, init, vision = out
+            msgs = getattr(request, "messages", None)
+            if (request.request_type == "chat" and vision is None and types and types[0] == "user" and msgs
+                    and msgs[0]["role"] == "system" and msgs[-1]["role"] == "user"):
+                n = 0
+                while msgs[n]["role"] == "system": n += 1
+                cta = dict(self.model_provider.cli_args.chat_template_args)
+                if args.chat_template_kwargs: cta.update(args.chat_template_kwargs)
+                st = tokenizer.apply_chat_template(msgs[:n] + [{"role": "user", "content": ""}], add_generation_prompt=False,
+                                                   tools=request.tools, tokenize=True, **cta)
+                k = 0; m = min(len(st), len(segments[0]) - 1)
+                while k < m and st[k] == prompt[k]: k += 1
+                if k >= _SYS_MIN:
+                    segments = [segments[0][:k], segments[0][k:]] + segments[1:]; types = ["system"] + types
+                    return prompt, segments, types, init, vision
+        except Exception as e:
+            print(f"[tp-cache] system checkpoint split skipped: {e!r}", flush=True)
+        return out
+    _RG._tokenize = _rg_tok2
+
+
+# ---- Prompt processing shares the GPU with active streams (TP_FAIR=1) -------------------------------
+# Stock scheduling runs ONE decode step per prompt block, so every active stream stalls (about one token
+# per second at 2,048-token blocks) while a long prompt loads. Here, while streams are decoding, a long
+# prompt is read in smaller blocks (TP_FAIR_CHUNK tokens) with enough decode steps in between to take
+# about TP_FAIR_MS of GPU time, i.e. roughly half the machine each. Counted in steps, not wall time, so
+# every rank makes the same choice. With no active stream the full block size is used.
+if os.environ.get("TP_FAIR", "1") == "1":
+    _F_CHUNK = int(os.environ.get("TP_FAIR_CHUNK", "1024")); _F_MS = float(os.environ.get("TP_FAIR_MS", "450"))
+    _F_FULL = int(os.environ.get("TP_PREFILL_STEP", "4096")); _F_STEP_MS = {1: 13.0, 2: 20.0, 3: 26.0, 4: 30.0}
+    # Short prompts jump the queue (TP_PREEMPT=1): prompts are read one at a time, so without this a
+    # follow-up turn with a few new tokens waits for a whole 100k-token prompt ahead of it. When a long
+    # prompt is in progress and a queued request has at most TP_PREEMPT_MAX tokens left to read, the long
+    # prompt's batch is set aside (self._stash), the short one is read and starts generating, then the
+    # long one resumes. remove()/extract_cache() look in the set-aside batch too.
+    _PRE = os.environ.get("TP_PREEMPT", "1") == "1"; _PRE_MAX = int(os.environ.get("TP_PREEMPT_MAX", "4096"))
+    def _left(seq): return sum(len(x) for x in seq)
+    def _promote_small(self):
+        if len(self._generation_batch) >= self.completion_batch_size: return False
+        for i, q in enumerate(self._unprocessed_sequences):
+            if _left(q[1]) <= _PRE_MAX:
+                if i:
+                    del self._unprocessed_sequences[i]; self._unprocessed_sequences.appendleft(q)
+                return True
+        return False
+    def _swap(self):
+        st = self._stash; self._stash = (self._prompt_batch, self._currently_processing)
+        self._prompt_batch, self._currently_processing = st
+    _F_DBG = os.environ.get("TP_FAIR_DEBUG") == "1"
+    _bg_next0 = G.BatchGenerator._next
+    def _bg_next(self):
+        st = getattr(self, "_stash", None)
+        if _F_DBG: print(f"[tp-fair] gen={len(self._generation_batch)} cur={[_left(q[0]) for q in self._currently_processing]} wait={[_left(q[1]) for q in self._unprocessed_sequences]} stash={st is not None}", flush=True)
+        if st is not None:
+            if len(self._prompt_batch) == 0 and not self._currently_processing and not _promote_small(self):
+                self._prompt_batch, self._currently_processing = st; self._stash = None
+        elif (_PRE and self._unprocessed_sequences and self._currently_processing
+              and any(_left(seq[0]) > _PRE_MAX for seq in self._currently_processing) and _promote_small(self)):
+            self._stash = (self._prompt_batch, self._currently_processing)
+            self._prompt_batch = G.PromptProcessingBatch.empty(self.model, self.sampler, prefill_step_size=self.prefill_step_size)
+            self._currently_processing = []
+        nb = len(self._generation_batch)
+        if nb > 0:
+            if any(_left(seq[0]) > _F_CHUNK for seq in self._currently_processing):
+                self._fair_i = getattr(self, "_fair_i", 0) + 1
+                if self._fair_i % max(1, round(_F_MS / _F_STEP_MS.get(nb, 29.0))) != 0:
+                    tic = _pc(); r = self._generation_batch.next()
+                    self._counters.decode_time += _pc() - tic; self._counters.generation_tokens += len(r); self._counters.generation_steps += 1
+                    return [], r
+            step = _F_CHUNK
+        else:
+            step = _F_FULL
+        self.prefill_step_size = step; self._prompt_batch.prefill_step_size = step
+        p0 = self._counters.prompt_tokens; r = _bg_next0(self)
+        if self._counters.prompt_tokens - p0 >= 256: _F_BREAK[0] = True
+        return r
+    # In distributed mode the server calls next() a fixed number of times (tuned so decode steps fill
+    # ~0.5 s) before it looks at the request queue again. With prompt blocks in the loop that is many
+    # seconds to a whole prompt, during which new requests are not even queued. Leave the loop after
+    # every sizeable prompt block (same decision on every rank).
+    _F_BREAK = [False]; _tb_next0 = S.TimeBudget.__next__
+    def _tb_next(self):
+        if _F_BREAK[0]:
+            _F_BREAK[0] = False; raise StopIteration()
+        return _tb_next0(self)
+    S.TimeBudget.__next__ = _tb_next
+    _bg_remove0 = G.BatchGenerator.remove; _bg_extract0 = G.BatchGenerator.extract_cache
+    def _bg_remove(self, uids, return_prompt_caches=False):
+        r = _bg_remove0(self, uids, return_prompt_caches)
+        if getattr(self, "_stash", None) is not None:
+            _swap(self)
+            try: r2 = _bg_remove0(self, uids, return_prompt_caches)
+            finally: _swap(self)
+            if r2: r = {**r2, **r}
+        return r
+    def _bg_extract(self, uids):
+        r = _bg_extract0(self, uids)
+        if getattr(self, "_stash", None) is not None:
+            rest = [u for u in uids if u not in r]
+            if rest:
+                _swap(self)
+                try: r.update(_bg_extract0(self, rest))
+                finally: _swap(self)
+        return r
+    G.BatchGenerator.remove = _bg_remove; G.BatchGenerator.extract_cache = _bg_extract
+    G.BatchGenerator._next = _bg_next
+
+
+# ---- Request-path trace (TP_TRACE=1): where the time before the first token goes --------------------
+if os.environ.get("TP_TRACE") == "1" and g.rank() == 0:
+    import time as _tt
+    _T0 = [_tt.perf_counter()]
+    def _tr(name, cls, attr, extra=None):
+        f0 = getattr(cls, attr)
+        def w(*a, **k):
+            t = _tt.perf_counter(); r = f0(*a, **k); d = _tt.perf_counter() - t
+            if d > 0.002 or extra: print(f"[tp-trace] +{1e3 * (t - _T0[0]):8.1f} ms {name:22s} {1e3 * d:7.1f} ms {extra(a, k, r) if extra else ''}", flush=True)
+            return r
+        setattr(cls, attr, w)
+    _RGc = next(c for c in vars(S).values() if isinstance(c, type) and "_tokenize" in vars(c) and "_generate" in vars(c))
+    def _mark(a, k, r):
+        if r is not None: _T0[0] = _tt.perf_counter()
+        return "REQUEST" if r is not None else ""
+    _nr0 = _RGc._next_request
+    def _nr(self, timeout=None):
+        t = _tt.perf_counter(); r = _nr0(self, timeout)
+        if r is not None:
+            print(f"[tp-trace] ---- request shared in {1e3 * (_tt.perf_counter() - t):.1f} ms (includes idle wait up to 100 ms)", flush=True); _T0[0] = _tt.perf_counter()
+        return r
+    _RGc._next_request = _nr
+    _tr("tokenize", _RGc, "_tokenize")
+    _tr("cache fetch", S.LRUPromptCache, "fetch_nearest_cache")
+    _tr("cache insert", S.LRUPromptCache, "insert_cache")
+    _tr("batch.next", G.BatchGenerator, "_next", lambda a, k, r: f"prompt_resp={len(r[0])} gen_resp={len(r[1])} cur={[sum(len(x) for x in q[0]) for q in a[0]._currently_processing]}")
+    _tr("extract_cache", G.BatchGenerator, "extract_cache")
+    _tr("remove", G.BatchGenerator, "remove")
+    _tr("prompt()", G.PromptProcessingBatch, "prompt")
+    _tr("split->generate", G.PromptProcessingBatch, "generate")
+    _tr("gen.extend", G.GenerationBatch, "extend")
+    _tr("insert_segments", G.BatchGenerator, "insert_segments")
+
+
+# ---- No buffer-cache flush after small prompt blocks (TP_CLEAR_MIN) ---------------------------------
+# mlx_lm frees MLX's buffer cache after every prompt block. For a block of a few hundred tokens that
+# costs more than it saves: the next forward (and the vision tower of the next image) re-allocates
+# everything (~50-100 ms per small request). Keep the flush for blocks of TP_CLEAR_MIN tokens or more.
+_CLEAR_MIN = int(os.environ.get("TP_CLEAR_MIN", "1024"))
+if _CLEAR_MIN > 0:
+    _pp_prompt0 = G.PromptProcessingBatch.prompt
+    def _pp_prompt(self, tokens):
+        if tokens and max(len(t) for t in tokens) >= _CLEAR_MIN: return _pp_prompt0(self, tokens)
+        keep = mx.clear_cache; mx.clear_cache = lambda: None
+        try: return _pp_prompt0(self, tokens)
+        finally: mx.clear_cache = keep
+    G.PromptProcessingBatch.prompt = _pp_prompt
+
 try:
     info = mx.device_info(); mx.set_cache_limit(int(info["memory_size"]))
 except Exception: pass
 sys.argv = ["mlx_lm.server", "--model", path, "--host", "0.0.0.0", "--port", os.environ.get("TP_PORT", "8010"),
             "--max-tokens", "32768", "--decode-concurrency", os.environ.get("TP_CONC", "1"), "--prompt-concurrency", os.environ.get("TP_PROMPT_CONC", os.environ.get("TP_CONC", "1")),
             # Same template settings the single-box oMLX deployment used (model_settings.json).
-            "--chat-template-args", os.environ.get("TP_CHAT_TEMPLATE_ARGS", '{"reasoning_effort": "low", "clear_thinking": false}')] + sys.argv[1:]
+            "--chat-template-args", os.environ.get("TP_CHAT_TEMPLATE_ARGS", '{"reasoning_effort": "low", "clear_thinking": false}')] \
+           + ["--prefill-step-size", os.environ.get("TP_PREFILL_STEP", "4096")] + sys.argv[1:]
 print(f"[r{g.rank()}] starting mlx_lm.server", flush=True)
 S.main()

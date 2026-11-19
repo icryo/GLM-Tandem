@@ -22,7 +22,7 @@ All rates are decode tokens/s as seen by a streaming client. "Prose" means fresh
 | JSON extraction | 148 |
 | Add docstrings, whole file back | 210 |
 | Code edit, whole file back | 219 |
-| Request with an image | 133–136 (measured before the last change) |
+| Request with an image (decode) | 142–146 |
 
 **Several requests at once** (total tokens/s including prompt time, 300-token prose, short prompts)
 
@@ -30,7 +30,7 @@ All rates are decode tokens/s as seen by a streaming client. "Prose" means fresh
 |---|---|---|
 | 2 | 164–169 | 93–99 |
 | 4 | 200 | 54–61 |
-| 8 | 223 | 30–34 |
+| 8 | 223–230 | 30–34 |
 
 **One request at long context** (from 146 real agent requests)
 
@@ -40,14 +40,29 @@ All rates are decode tokens/s as seen by a streaming client. "Prose" means fresh
 | 50–80k | 126 | 0.7 s |
 | 80–200k | 122 | 0.9 s |
 
-Prompt processing runs at about 2,080 tokens/s. Vision costs 1.05 GiB per Mac and nothing during decoding.
+Each pass costs about 1.2 ms more at 31k tokens and 2.1 ms more at 108k than at short context: every sparse
+layer scores all pooled keys of the context (compute-bound). Splitting that across the Macs would save about 0.2 ms.
+
+**Prompts and scheduling**
+
+| | Before | Now |
+|---|---|---|
+| Cold prompt, 108k tokens (tokens/s) | 2,000 | 2,440 |
+| Next turn of a 31k conversation after 40 unrelated short requests | 12.5 s | 0.25 s |
+| New conversation with the same 31k system prompt | 12.5 s | 0.20 s |
+| New 13k prompt while a 108k conversation is cached | 17–20 s | 5.8 s |
+| A stream's rate while another request's 31k prompt loads | 4 tok/s, 3–4 s pauses | 40–46 tok/s, 0.5 s pauses |
+| Short request arriving behind a 108k prompt: first token | after the whole prompt (45 s+) | 1.3–4 s |
+| Small image request (559 tokens in, 150 out), one at a time | 1.62 s | 1.50 s |
+
+Vision costs 1.05 GiB per Mac and nothing during decoding.
 
 ## Known problems
 
-- **Requests with very different context lengths decoded together are very slow.** A 13k-token request next to a
-  105k-token one ran at about 5 tok/s each. Cause not yet found.
-- **Prompt processing blocks decoding.** Prompts are processed one at a time, and while one is being processed
-  the other requests get about one step per second.
+- **A long prompt and active streams share the machine about half and half.** The prompt loads at roughly half
+  speed while streams decode at 35–45% of theirs (`TP_FAIR_MS`, `TP_FAIR_CHUNK`).
+- **Prompts are still read one at a time.** A short one jumps ahead of a long one (`TP_PREEMPT`), two long ones queue.
+- **The first prompt after a start is about 15 s slower** (kernels compile on first use).
 - **No prompt reuse when two prompts diverge mid-message.** The linear-attention state cannot be rewound, so
   reuse only happens at the end of a system or user message.
 - **Tied to oMLX 0.8.0rc1.** The server patches oMLX's GLM runtime at load time by rewriting its source, with
@@ -76,7 +91,20 @@ Prompt processing runs at about 2,080 tokens/s. Vision costs 1.05 GiB per Mac an
    that followed them there are offered as a draft, up to 7 at a time (`TP_LOOKUP`, on by default). Every
    drafted token is still verified, so the output does not change. This is where the 210–219 tok/s on code
    edits and docstrings comes from; fresh prose gets almost nothing from it.
-9. **Images** go through the same fast path: the vision tower runs once at prompt time (`tpvision.py`).
+9. **Images** go through the same fast path: the vision tower runs once at prompt time (`tpvision.py`), and the
+   image and the text after it are read in one pass.
+10. **A prompt cache that keeps long conversations.** Stock mlx_lm keeps 10 entries and drops the oldest, so a
+    burst of short requests evicts a 100k-token conversation. Here short entries have their own small tier and
+    long ones are limited by bytes (`TP_CACHE_GB`, default 40), least recently used first. Two stock defects are
+    patched as well: the cache lookup's search for a longer entry is quadratic in its length (11–12 s on the
+    generation thread next to a cached 100k conversation), and with this chat template the system-prompt
+    checkpoint was usually not saved.
+11. **Prompts and decoding take turns.** While streams are decoding, a long prompt is read in 1,024-token blocks
+    with about 450 ms of decode steps in between; the server looks at its request queue after every block
+    (stock: after a fixed number of steps, which during a prompt means after the whole prompt); short prompts
+    jump ahead of a long one.
+12. **Three Thunderbolt links and 4,096-token prompt blocks.** Decode speed is the same as on one link; prompt
+    processing is 13% faster with three links and 4–8% faster with larger blocks. Two links gave +11%.
 
 ## What did not help
 
@@ -88,6 +116,9 @@ All measured on this setup; the code for the first two is in `experiments/`.
 - A merged fence kernel; reading each distinct expert once per pass; leaving sparse attention unsplit;
   raising thread priority; skipping index upkeep: no gain.
 - Moving the host loop out of Python: estimated at 1–3%, not built.
+- The "mixed context lengths are slow" problem listed here earlier was a misdiagnosis: 13k and 108k requests decode
+  together at 66–86 tok/s each. The slow case was a cache eviction followed by a full re-read that starved the other stream.
+- Prompt blocks of 16,384 tokens: no faster than 8,192.
 - Speculation with more than four concurrent requests: extra rows cost memory bandwidth that is already used up.
 
 ## Layout
