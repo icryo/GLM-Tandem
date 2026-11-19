@@ -72,7 +72,11 @@ Prompt processing runs at about 2,080 tokens/s. Vision costs 1.05 GiB per Mac an
 7. **Concurrent requests are rows of one fused pass**, not a batch (`kdaseq.py` gives the linear-attention
    kernel a sequence axis). With 2–4 requests each one also carries its own draft and emits one or two tokens
    per step.
-8. **Images** go through the same fast path: the vision tower runs once at prompt time (`tpvision.py`).
+8. **Drafts copied from the context.** When the last few tokens also appear earlier in the context, the tokens
+   that followed them there are offered as a draft, up to 7 at a time (`TP_LOOKUP`, on by default). Every
+   drafted token is still verified, so the output does not change. This is where the 210–219 tok/s on code
+   edits and docstrings comes from; fresh prose gets almost nothing from it.
+9. **Images** go through the same fast path: the vision tower runs once at prompt time (`tpvision.py`).
 
 ## What did not help
 
