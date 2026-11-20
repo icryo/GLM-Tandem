@@ -58,14 +58,44 @@ def install(S, model, model_path, rank):
 
     cls = type(model)
 
+    # Memory of the tower. Its attention is global over one image's patches: at the processor's maximum
+    # (about 32k patches) the stock call materialises a 16 x 32k x 32k score tensor per layer (~32 GB), and
+    # several images in one request were evaluated in one graph. Three large images reached the 230 GB
+    # wired limit: Metal failed the command buffer on one rank only, the other rank went on into the trunk
+    # and waited for a sum that never came (server hung while health checks passed). Here: queries go
+    # through attention in blocks of TP_VIS_QCHUNK rows (same result), and each image is evaluated on its own.
+    _QC = int(os.environ.get("TP_VIS_QCHUNK", "4096"))
+    if _QC > 0:
+        import mlx_vlm.models.glm5_next.vision as _V
+        _Att = type(tower.blocks[0].attn)
+        def _att_call(self, hidden_states, cu_seqlens, position_embeddings):
+            n = hidden_states.shape[0]
+            qkv = _V.linear_forward(self.qkv, hidden_states).reshape(n, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
+            q, k, v = (t.squeeze(0) for t in mx.split(qkv, 3, axis=0))
+            q = self.q_norm(q); k = self.k_norm(k)
+            cos, sin = position_embeddings
+            q, k = _V.apply_rotary_pos_emb_vision(q, k, cos, sin)
+            q = q.transpose(1, 0, 2)[None]; k = k.transpose(1, 0, 2)[None]; v = v.transpose(1, 0, 2)[None]
+            bounds = [int(x) for x in cu_seqlens.tolist()]
+            outs = []
+            for a, b in zip(bounds[:-1], bounds[1:]):
+                ks, vs = k[:, :, a:b], v[:, :, a:b]
+                for c in range(a, b, _QC):
+                    outs.append(mx.fast.scaled_dot_product_attention(q[:, :, c:min(c + _QC, b)], ks, vs, scale=self.scale, mask=None))
+            o = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+            return _V.linear_forward(self.proj, o.transpose(0, 2, 1, 3).reshape(n, -1))
+        _Att.__call__ = _att_call
+
     def embed_inputs(self, tokens, pixel_values=None):
         """Token embeddings [T, H] with every image token replaced by its vision feature."""
         emb = self.language_model.model.embed_tokens(tokens)
         if not pixel_values:
             return emb
-        feats = mx.concatenate(
-            [tower(p.astype(dtype), mx.array([g])) for p, g in pixel_values], axis=0
-        ).astype(emb.dtype)
+        feats = []
+        for p, g in pixel_values:
+            f = tower(p.astype(dtype), mx.array([g])).astype(emb.dtype)
+            mx.eval(f); feats.append(f)
+        feats = mx.concatenate(feats, axis=0) if len(feats) > 1 else feats[0]
         mask = tokens == image_token_id
         n = int(mask.sum().item())
         # Image rows already in the prompt cache (an image split by the cached prefix) keep the
@@ -104,6 +134,9 @@ def install(S, model, model_path, rank):
                 return iter(())                       # "has images" no longer means "not batchable"
             return orig_parts(messages)
 
+        _beat = getattr(S, '_tp_beat', lambda: None)
+        _FT = os.environ.get('TP_VIS_FAILTEST', '')
+        _VBLK = int(os.environ.get('TP_VIS_BLOCK', os.environ.get('TP_PREFILL_STEP', '4096')))
         _VT = os.environ.get('TP_TRACE') == '1'; _MERGE = os.environ.get('TP_VISION_MERGE', '1') == '1'
         def _tokenize(self, tokenizer, request, args):
             _t = [__import__('time').perf_counter()]
@@ -131,13 +164,40 @@ def install(S, model, model_path, rank):
                 def prefill():
                     toks = mx.array(prompt[done:end])
                     n = sum(i < done for i in vision.starts)
-                    emb = mdl.embed_inputs(toks, pixel_values=vision.pixel_values[n:])
-                    mx.eval(emb); _lap('tower+embed')
+                    # The tower is local to each rank, so one rank can fail (memory) while the other does
+                    # not. Agree on the outcome before the trunk: all ranks raise, or all go on.
+                    err = None
+                    try:
+                        if _FT and len(toks) > 3000:        # test hooks: "<rank>" fails there, "hang<rank>" stalls there
+                            if _FT == str(rank): raise RuntimeError("TP_VIS_FAILTEST")
+                            if _FT == f"hang{rank}": __import__('time').sleep(100000)
+                        emb = mdl.embed_inputs(toks, pixel_values=vision.pixel_values[n:])
+                        mx.eval(emb)
+                    except Exception as e:
+                        err = e
+                    world = mx.distributed.init()
+                    if world.size() > 1:
+                        bad = int(mx.distributed.all_sum(mx.array(0 if err is None else 1)).item())
+                    else:
+                        bad = 0 if err is None else 1
+                    if bad:
+                        emb = None; mx.clear_cache()
+                        raise RuntimeError(f"image could not be processed ({err if err is not None else 'failed on the other machine'})")
+                    _lap('tower+embed')
                     trunk = mdl.language_model.model
-                    for a in range(0, end - done, 1024):
-                        b = min(a + 1024, end - done)
-                        trunk(toks[None, a:b], cache=cache, inputs_embeds=emb[None, a:b])
-                        mx.eval([c.state for c in cache])
+                    try:
+                        # One block of up to TP_PREFILL_STEP tokens: every forward of 130+ rows costs a fixed
+                        # ~200 ms (one pass over all expert weights), so 1,024-token blocks paid it per block.
+                        for a in range(0, end - done, _VBLK):
+                            b = min(a + _VBLK, end - done)
+                            trunk(toks[None, a:b], cache=cache, inputs_embeds=emb[None, a:b])
+                            mx.eval([c.state for c in cache])
+                            _beat()
+                    except Exception as e:
+                        # Mid-trunk the ranks are no longer in step; nothing can be recovered. Exit so the
+                        # supervisor restarts both ranks instead of leaving a server that never answers.
+                        print(f"[tp-vis] fatal: image prefill failed mid-trunk: {e!r}; exiting", flush=True)
+                        os._exit(70)
                 if stream is not None:
                     with mx.stream(stream):
                         prefill()

@@ -47,6 +47,10 @@ sleep 3
 # sshd child and Local Network privacy cuts its link to rank 0.
 $REMOTE "cd $DIR/server && exec env ${ENVS[*]} MLX_RANK=1 $P tpserve.py > /tmp/tpserve_r1.log 2>&1" < /dev/null &
 peer=$!
+# If rank 1 goes away, rank 0 would wait on it until its own watchdog fires (TP_WATCHDOG_S, 150 s). Stop rank 0
+# as soon as rank 1's session ends so a supervisor restarts both. Does nothing once this script has exited.
+me=$$
+{ while kill -0 $peer 2>/dev/null; do sleep 2; done; kill -0 $me 2>/dev/null && $SELF 'pkill -f "python3 tpserve.py"; true' 2>/dev/null; } &
 wait $child
 code=$?
 cleanup

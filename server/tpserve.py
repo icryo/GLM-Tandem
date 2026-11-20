@@ -342,16 +342,60 @@ def _pre_undo(self, st):
     st.pre = None; st.pre_saved = None; st.a_val = None
     _pre["gm"].__dict__.pop("_tp_pre", None)
 
+_LK_M = 1000003; _LK_64 = (1 << 64) - 1
+_LK_REUSE = os.environ.get("TP_LOOK_REUSE", "1") == "1"; _LK_POOL = []
+def _lk_key(h, i, n, tok=None):
+    """Hash of the n-gram ending at index i of h (or at a virtual token `tok` appended to h)."""
+    if tok is None: k = h[i] & _LK_64; j0 = 1
+    else: k = tok & _LK_64; j0 = 0; i = len(h)
+    for j in range(1 if j0 else 1, n):
+        k = (k * _LK_M + h[i - j]) & _LK_64
+    return k
+
 class _Lookup:
-    """Prompt-lookup drafting: continue the most recent earlier occurrence of the last few tokens."""
+    """Prompt-lookup drafting: continue the most recent earlier occurrence of the last few tokens.
+
+    The index maps a 64-bit hash of each n-gram to the position after its latest occurrence; a hit is
+    checked against the tokens, so a collision is a miss. The first build over a long prompt is one
+    numpy pass (18 ms at 190k tokens; the per-token Python loop took 44 ms on every request)."""
     def __init__(self, hist):
         self.hist = hist; self.idx = {n: {} for n in LOOK_NGRAMS}; self.upto = 0
         self.length = 2; self.ema = 0.6; self.cool = 0
+        # The next turn of a conversation starts with almost the same tokens: take over the index of the
+        # earlier request (TP_LOOK_REUSE=1) and re-index only from where the two histories part. Entries
+        # left over from the old tail are harmless: every hit is checked against the tokens.
+        if _LK_REUSE and len(hist) >= 8192:
+            best = None; bl = 0
+            for o in _LK_POOL:
+                oh = o.hist; n = min(len(oh), len(hist))
+                if n < 4096 or oh[:64] != hist[:64]: continue
+                lo, hi = 0, n
+                if oh[:n] == hist[:n]: lo = n
+                else:
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if oh[lo:mid] == hist[lo:mid]: lo = mid
+                        else: hi = mid - 1
+                if lo > bl: best, bl = o, lo
+            if best is not None and bl >= len(hist) // 2:
+                _LK_POOL.remove(best); self.idx = best.idx; self.upto = max(0, min(best.upto, bl - 1)); best.idx = {n: {} for n in LOOK_NGRAMS}; best.upto = 0
+            _LK_POOL.append(self)
+            while len(_LK_POOL) > 6: _LK_POOL.pop(0)
     def _index(self):
         h = self.hist; end = len(h) - 1                      # never index the n-gram that ends at the last token
+        if end - self.upto > 2048 and self.upto == 0:
+            import numpy as _np
+            a = _np.asarray(h[:end], dtype=_np.int64).astype(_np.uint64); M = _np.uint64(_LK_M)
+            with _np.errstate(over="ignore"):
+                for n in LOOK_NGRAMS:
+                    if end < n: continue
+                    k = a[n - 1:].copy()
+                    for j in range(1, n): k = k * M + a[n - 1 - j:end - j]
+                    self.idx[n] = dict(zip(k.tolist(), range(n, end + 1)))
+            self.upto = end; return
         for i in range(self.upto, end):
             for n in LOOK_NGRAMS:
-                if i + 1 >= n: self.idx[n][tuple(h[i - n + 1:i + 1])] = i + 1
+                if i + 1 >= n: self.idx[n][_lk_key(h, i, n)] = i + 1
         self.upto = max(self.upto, end)
     def draft(self, limit):
         self._index()
@@ -360,8 +404,8 @@ class _Lookup:
         if L < 1: return None
         for n in LOOK_NGRAMS:
             if len(h) < n: continue
-            pos = self.idx[n].get(tuple(h[-n:]))
-            if pos is not None:
+            pos = self.idx[n].get(_lk_key(h, len(h) - 1, n))
+            if pos is not None and h[pos - n:pos] == h[-n:]:
                 cont = h[pos:pos + L]
                 if cont: return cont
         return None
@@ -371,8 +415,8 @@ class _Lookup:
         if L < 1: return None
         for n in LOOK_NGRAMS:
             if len(h) + 1 < n: continue
-            pos = self.idx[n].get(tuple(h[len(h) - n + 1:]) + (tok,))
-            if pos is not None:
+            pos = self.idx[n].get(_lk_key(h, 0, n, tok))
+            if pos is not None and h[pos - n:pos] == h[len(h) - n + 1:] + [tok]:
                 cont = h[pos:pos + L]
                 if cont: return cont
         return None
@@ -1554,14 +1598,55 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
     def _pc_drop(self, i):
         model, tokens = self._lru.pop(i); e = self._trie.pop(model, tokens)
         self._n_bytes -= e.nbytes; self._n_bytes_by_type[e.cache_type] -= e.nbytes
+    # Which long entries to keep (TP_CACHE_THIN=1). One turn of a 170k-token conversation stores two
+    # entries of ~2.3 GB each (end of the user message, end of the answer) and nothing removed the earlier
+    # ones, so one conversation filled the cache in about eight turns and plain least-recently-used
+    # eviction then dropped the shared system-prompt checkpoint (never "used" by a long conversation) and
+    # other conversations before the dead copies. On inserting a long entry:
+    #  - earlier checkpoints of the same conversation (entries that are a prefix of the new one) are
+    #    thinned: the longest stays (the next turn starts from it), then one per TP_CACHE_SPACING of the
+    #    conversation's length (default 12%), so a client that edits its history re-reads only from the
+    #    nearest older checkpoint instead of from the start;
+    #  - answer-end entries that branch off one of those checkpoints but are not a prefix of the new entry
+    #    are dropped: the client sent the answer back in a different form, so they can never match again;
+    #  - system-prompt entries are evicted last.
+    # Prefix tests sample the boundary instead of comparing every token: a wrong guess only changes what
+    # is kept, never what is served (lookups stay exact).
+    _C_THIN = os.environ.get("TP_CACHE_THIN", "1") == "1"; _C_SPACING = float(os.environ.get("TP_CACHE_SPACING", "0.12"))
+    def _pc_is_prefix(short, long_):
+        n = len(short)
+        if n >= len(long_): return False
+        return short[-16:] == long_[n - 16:n] and short[:16] == long_[:16] and short[n // 2:n // 2 + 16] == long_[n // 2:n // 2 + 16]
+    def _pc_thin(self, model, tokens):
+        o = self._lru; n = len(tokens); items = o._items
+        anc = [it for it in items[:-1] if it[0] == model and it[2] != "system" and _C_SMALL <= len(it[1]) < n and _pc_is_prefix(it[1], tokens)]
+        if not anc: return
+        anc.sort(key=lambda it: -len(it[1])); drop = []
+        space = max(_C_SMALL, int(_C_SPACING * n)); mark = n
+        for j, it in enumerate(anc):
+            if j == 0: continue                              # the checkpoint the next turn starts from
+            if len(it[1]) <= mark - space: mark = len(it[1])
+            else: drop.append(it)
+        parent = anc[0][1]
+        for it in items[:-1]:
+            if (it[0] == model and it[2] == "assistant" and len(it[1]) > len(parent) and it not in anc
+                    and not _pc_is_prefix(tokens, it[1]) and _pc_is_prefix(parent, it[1])):
+                drop.append(it)
+        for it in drop:
+            i = o._find(it[0], it[1])
+            if i >= 0 and i != len(o) - 1: _pc_drop(self, i)
     _pc_insert = _PC.insert_cache
     def _pc_insert2(self, model, tokens, prompt_cache, *, cache_type="assistant"):
         _pc_insert(self, model, tokens, prompt_cache, cache_type=cache_type)
         o = self._lru
         while o.n_small() > _C_NSMALL: _pc_drop(self, o.oldest(True))
+        if _C_THIN and len(tokens) >= _C_SMALL:
+            try: _pc_thin(self, model, tokens)
+            except Exception as e: print(f"[tp-cache] thinning skipped: {e!r}", flush=True)
         while self._n_bytes > _C_BYTES and len(o) > 1:
-            i = o.oldest(False)
-            if i < 0 or i == len(o) - 1: i = 0          # no other long entry left: oldest of any kind
+            i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system"), -1)
+            if i < 0: i = o.oldest(False)                # only system prompts and the new entry are long
+            if i < 0 or i == len(o) - 1: i = 0           # no other long entry left: oldest of any kind
             if i == len(o) - 1: break                    # never the entry just inserted
             _pc_drop(self, i)
     _PC.insert_cache = _pc_insert2
@@ -1692,6 +1777,111 @@ if os.environ.get("TP_FAIR", "1") == "1":
     G.BatchGenerator._next = _bg_next
 
 
+# ---- Tokenize only what is new (TP_TOKMEMO=1) -------------------------------------------------------
+# Every turn of a conversation re-tokenizes the whole rendered prompt: 75 ms at 190k tokens, and the
+# server renders the system prompt twice more to find its end (20 ms each), so about 115 ms per turn
+# before any GPU work. The rendered text of turn N+1 starts with almost all of turn N's text. A role
+# marker (<|system|>, <|user|>, <|assistant|>, <|observation|>) is an added special token: the tokenizer
+# splits the text there before anything else, so the tokens before a marker do not depend on what
+# follows it. So: find the longest common prefix with a remembered text, cut at the last role marker
+# inside it, reuse the remembered tokens up to there and encode only the rest.
+# TP_TOKMEMO_CHECK=1 compares every result with a full encode (testing).
+if os.environ.get("TP_TOKMEMO", "1") == "1":
+    import bisect as _bis
+    _TM_MAX = int(os.environ.get("TP_TOKMEMO_N", "8")); _TM_MIN = 20000; _TM_CHECK = os.environ.get("TP_TOKMEMO_CHECK") == "1"
+    _TM = []                                              # entries [text, ids, cut_chars, cut_toks], most recently used last
+    _TM_ROLES = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"); _TM_IDS = {}
+    def _tm_lcp(a, b):
+        n = min(len(a), len(b))
+        if a[:n] == b[:n]: return n
+        lo, hi = 0, n
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if a[lo:mid] == b[lo:mid]: lo = mid
+            else: hi = mid - 1
+        return lo
+    def _tm_encode(hf, text):
+        if len(text) < _TM_MIN: return hf.encode(text, add_special_tokens=False)
+        bk = hf.backend_tokenizer
+        if id(hf) not in _TM_IDS:
+            ok = all((t := hf.added_tokens_decoder.get(hf.convert_tokens_to_ids(r))) is not None and t.special and not t.lstrip and not t.rstrip for r in _TM_ROLES)
+            _TM_IDS[id(hf)] = frozenset(hf.convert_tokens_to_ids(r) for r in _TM_ROLES) if ok else None
+        roles = _TM_IDS[id(hf)]
+        if roles is None: return hf.encode(text, add_special_tokens=False)
+        best = None; bl = 0; head = text[:64]
+        for e in _TM:
+            if e[0][:64] != head: continue
+            if len(e[0]) == len(text) and e[0] == text:
+                _TM.remove(e); _TM.append(e); return list(e[1])
+            l = _tm_lcp(e[0], text)
+            if l > bl: best, bl = e, l
+        off = 0; ti = 0
+        if best is not None:
+            k = _bis.bisect_right(best[2], bl) - 1         # last role marker starting at or before the common prefix end
+            if k >= 0 and best[2][k] > 0: off = best[2][k]; ti = best[3][k]
+        enc = bk.encode(text[off:] if off else text, add_special_tokens=False)
+        tail = enc.ids; offs = enc.offsets
+        if off:
+            ids = best[1][:ti] + tail; cc = best[2][:k]; ct = best[3][:k]
+        else:
+            ids = list(tail); cc = []; ct = []
+        for j, t in enumerate(tail):
+            if t in roles: cc.append(off + offs[j][0]); ct.append(ti + j)
+        if _TM_CHECK:
+            full = hf.encode(text, add_special_tokens=False)
+            print(f"[tp-tokmemo] {len(text)} chars, reused {ti} of {len(ids)} tokens, {'OK' if list(full) == ids else 'MISMATCH'}", flush=True)
+            if list(full) != ids: return full
+        if best is not None and bl >= len(best[0]) - 8192 and len(text) >= bl: _TM.remove(best)      # the conversation grew: replace its entry
+        _TM.append([text, ids, cc, ct])
+        while len(_TM) > _TM_MAX: _TM.pop(0)
+        return list(ids)
+    from mlx_lm.tokenizer_utils import TokenizerWrapper as _TWc
+    _tw_act = _TWc.apply_chat_template
+    def _tw_act2(self, *args, tokenize=True, **kwargs):
+        if not tokenize: return _tw_act(self, *args, tokenize=False, **kwargs)
+        text = _tw_act(self, *args, tokenize=False, **kwargs)
+        if not isinstance(text, str): return _tw_act(self, *args, tokenize=True, **kwargs)
+        return _tm_encode(self._tokenizer, text)
+    _TWc.apply_chat_template = _tw_act2
+
+# ---- Never hang (TP_WATCHDOG_S, default 150; 0 = off) -----------------------------------------------
+# Seen live: one rank failed a command buffer, the other waited for its sum forever; /health and
+# /v1/models kept answering, so the supervisor did not restart anything (19 minutes of silence).
+# Two rules: a generation thread that dies takes the process with it, and a generation loop that has
+# not turned for TP_WATCHDOG_S seconds does the same. The loop turns every 0.1 s when idle and at least
+# once per prompt block or decode step when busy; the longest legitimate pauses are first-use kernel
+# compiles (~15 s) and a vision tower pass (~5 s). The supervisor restarts both ranks on exit.
+_WD = float(os.environ.get("TP_WATCHDOG_S", "150"))
+if _WD > 0:
+    import threading as _th, time as _tm
+    _wd_last = [None]
+    def _tp_beat(): _wd_last[0] = _tm.monotonic()
+    S._tp_beat = _tp_beat
+    _RGc = next(c for c in vars(S).values() if isinstance(c, type) and "_generate" in vars(c) and "_next_request" in vars(c))
+    _wd_nr = _RGc._next_request
+    def _wd_next_request(self, timeout=None):      # timeout None = do not wait; 0.1 = idle poll
+        _tp_beat(); r = _wd_nr(self, timeout); _tp_beat(); return r
+    _RGc._next_request = _wd_next_request
+    _wd_bn = G.BatchGenerator._next
+    def _wd_bg_next(self, *a, **k):
+        _tp_beat(); r = _wd_bn(self, *a, **k); _tp_beat(); return r
+    G.BatchGenerator._next = _wd_bg_next
+    _wd_run = _RGc._run_generate
+    def _wd_run_generate(self):
+        _wd_run(self)
+        if getattr(self, "_generation_failed", False):
+            print("[tp] fatal: generation thread died; exiting so the supervisor restarts the server", flush=True)
+            os._exit(71)
+    _RGc._run_generate = _wd_run_generate
+    def _wd_loop():
+        while True:
+            _tm.sleep(5)
+            t = _wd_last[0]
+            if t is not None and _tm.monotonic() - t > _WD:
+                print(f"[tp] fatal: generation loop silent for {_tm.monotonic() - t:.0f} s; exiting so the supervisor restarts the server", flush=True)
+                os._exit(72)
+    _th.Thread(target=_wd_loop, daemon=True).start()
+
 # ---- Request-path trace (TP_TRACE=1): where the time before the first token goes --------------------
 if os.environ.get("TP_TRACE") == "1" and g.rank() == 0:
     import time as _tt
@@ -1722,6 +1912,28 @@ if os.environ.get("TP_TRACE") == "1" and g.rank() == 0:
     _tr("remove", G.BatchGenerator, "remove")
     _tr("prompt()", G.PromptProcessingBatch, "prompt")
     _tr("split->generate", G.PromptProcessingBatch, "generate")
+    if os.environ.get("TP_PROF") == "1":
+        import cProfile, pstats, io as _io
+        def _prof(cls, attr, minms=40):
+            f0 = getattr(cls, attr)
+            def w(*a, **k):
+                pr = cProfile.Profile(); t = _tt.perf_counter(); pr.enable(); r = f0(*a, **k); pr.disable()
+                if 1e3 * (_tt.perf_counter() - t) >= minms:
+                    b = _io.StringIO(); pstats.Stats(pr, stream=b).sort_stats("cumulative").print_stats(22); print(f"[tp-prof] {attr}\n" + "\n".join(l[:170] for l in b.getvalue().splitlines()[4:34]), flush=True)
+                return r
+            setattr(cls, attr, w)
+        _prof(G.PromptProcessingBatch, "generate"); _prof(_RGc, "_tokenize")
+    if os.environ.get("TP_PROF") == "2":                  # profile of all decode steps, printed every TP_PROF_N calls
+        import cProfile, pstats, io as _io
+        _pp = [cProfile.Profile(), 0]; _pn0 = G.BatchGenerator._next; _PN = int(os.environ.get("TP_PROF_N", "150"))
+        def _pnext(self, *a, **k):
+            _pp[0].enable(); r = _pn0(self, *a, **k); _pp[0].disable()
+            if r[1]: _pp[1] += 1
+            if _pp[1] >= _PN:
+                b = _io.StringIO(); pstats.Stats(_pp[0], stream=b).sort_stats("tottime").print_stats(28); print(f"[tp-prof] {_PN} decode steps\n" + "\n".join(l[:150] for l in b.getvalue().splitlines()[4:40]), flush=True)
+                _pp[0] = cProfile.Profile(); _pp[1] = 0
+            return r
+        G.BatchGenerator._next = _pnext
     _tr("gen.extend", G.GenerationBatch, "extend")
     _tr("insert_segments", G.BatchGenerator, "insert_segments")
 
@@ -1749,4 +1961,19 @@ sys.argv = ["mlx_lm.server", "--model", path, "--host", "0.0.0.0", "--port", os.
             "--chat-template-args", os.environ.get("TP_CHAT_TEMPLATE_ARGS", '{"reasoning_effort": "low", "clear_thinking": false}')] \
            + ["--prefill-step-size", os.environ.get("TP_PREFILL_STEP", "4096")] + sys.argv[1:]
 print(f"[r{g.rank()}] starting mlx_lm.server", flush=True)
+# First request after a start pays ~14 s once (kernels compile, weights are touched for the first time).
+# Send it ourselves as soon as the port answers (TP_WARMUP=1), so the first real request does not.
+if os.environ.get("TP_WARMUP", "1") == "1" and g.rank() == 0:
+    def _warm():
+        import json as _j, time as _t, urllib.request as _u
+        url = f"http://127.0.0.1:{os.environ.get('TP_PORT', '8010')}/v1/chat/completions"
+        body = _j.dumps(dict(model="default_model", max_tokens=8, temperature=0, messages=[{"role": "user", "content": "Say OK."}])).encode()
+        for _ in range(600):
+            _t.sleep(1)
+            try:
+                t = _t.time(); _u.urlopen(_u.Request(url, body, {"Content-Type": "application/json"}), timeout=300).read()
+                print(f"[tp] warm-up request done in {_t.time() - t:.1f} s", flush=True); return
+            except Exception:
+                pass
+    import threading as _wth; _wth.Thread(target=_warm, daemon=True).start()
 S.main()

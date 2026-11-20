@@ -54,6 +54,12 @@ layer scores all pooled keys of the context (compute-bound). Splitting that acro
 | A stream's rate while another request's 31k prompt loads | 4 tok/s, 3–4 s pauses | 40–46 tok/s, 0.5 s pauses |
 | Short request arriving behind a 108k prompt: first token | after the whole prompt (45 s+) | 1.3–4 s |
 | Small image request (559 tokens in, 150 out), one at a time | 1.62 s | 1.50 s |
+| Agent turn at 195k context (560 new tokens in, about 20 out) | 0.92 s | 0.73 s |
+| Client edits a message halfway through a 173k conversation | about 75 s (full re-read) | 31 s |
+| Prompt cache held after 18 turns of a 172k conversation | about 35 GB | 8 GB |
+| Request with one 2,145-token image (24 tokens out) | 1.63 s | 1.34 s |
+| Request with three maximum-size images (23,826 tokens) | out of memory, then a hung server | 14 s |
+| First request after a start | 15 s | 0.4 s (the one-time cost is paid at start-up) |
 
 Vision costs 1.05 GiB per Mac and nothing during decoding.
 
@@ -62,7 +68,12 @@ Vision costs 1.05 GiB per Mac and nothing during decoding.
 - **A long prompt and active streams share the machine about half and half.** The prompt loads at roughly half
   speed while streams decode at 35–45% of theirs (`TP_FAIR_MS`, `TP_FAIR_CHUNK`).
 - **Prompts are still read one at a time.** A short one jumps ahead of a long one (`TP_PREEMPT`), two long ones queue.
-- **The first prompt after a start is about 15 s slower** (kernels compile on first use).
+- **Reading 130 or more tokens costs a fixed 200 ms** (one pass over all expert weights) plus 0.3 ms per token;
+  below that, about 2 ms per token. Every turn and every image request pays it once. Not fixable in software here.
+- **An image prompt is read without yielding to active streams**: up to about 1.4 s per 4,096 image tokens.
+- **Two prompts cannot be read as one batch** (`TP_PROMPT_CONC` must stay 1): the padded batch path calls
+  `finalize()` on a cache slot this model never fills, and padding through the linear-attention state is unverified.
+- **Long context costs a flat 7 ms per pass at 195k tokens** (12 ms per pass at short context), whatever the number of rows.
 - **No prompt reuse when two prompts diverge mid-message.** The linear-attention state cannot be rewound, so
   reuse only happens at the end of a system or user message.
 - **Tied to oMLX 0.8.0rc1.** The server patches oMLX's GLM runtime at load time by rewriting its source, with
@@ -106,6 +117,35 @@ Vision costs 1.05 GiB per Mac and nothing during decoding.
 12. **Three Thunderbolt links and 4,096-token prompt blocks.** Decode speed is the same as on one link; prompt
     processing is 13% faster with three links and 4–8% faster with larger blocks. Two links gave +11%.
 
+13. **Tokenizing only what is new.** The stock server tokenizes the whole rendered prompt on every turn and the
+    system prompt twice more (125 ms at 195k tokens). A role marker is a special token, so the tokens before one
+    do not depend on what follows: the common prefix with the previous turn's text is cut at the last role marker,
+    its tokens are reused and only the rest is encoded (4 ms). `bench/tokmemotest.py` checks it against a full
+    encode on randomised conversations; `TP_TOKMEMO_CHECK=1` checks every live request.
+14. **The lookup index is kept between turns** and its first build is one numpy pass (44 ms per turn before).
+15. **Cache entries are chosen, not just aged.** Earlier checkpoints of the same conversation are thinned to one per
+    12% of its length, answer-end entries that can no longer match are dropped, and system-prompt checkpoints are
+    evicted last (`TP_CACHE_THIN`, `TP_CACHE_SPACING`).
+16. **Image prompts in blocks of up to 4,096 tokens** instead of 1,024, because of the fixed cost per block.
+
+## Staying up
+
+- **Vision memory is bounded.** The tower's attention is global over an image's patches; at the processor's
+  maximum (about 32k patches) the stock call builds a 32 GB score tensor per layer, and several images were
+  evaluated together. Queries now go through attention in blocks of 4,096 rows (same result) and images are
+  evaluated one at a time (`TP_VIS_QCHUNK`).
+- **Both Macs agree on a failure.** The tower runs separately on each Mac. If it fails on one, both raise and the
+  request gets an error; before, the other Mac went on and waited for a sum that never came.
+- **The server exits instead of hanging.** If the generation thread dies, or its loop has not turned for 150 s
+  (`TP_WATCHDOG_S`), the process exits; run the launcher under something that restarts it. Health checks alone
+  did not catch this: `/health` kept answering while nothing was generated.
+- **The launcher stops rank 0 when rank 1's session ends**, so recovery does not wait for the watchdog. Measured
+  by killing rank 1 under a supervisor that restarts the launcher on exit: answering again after 39 s (183 s with
+  the watchdog alone).
+- **Warm-up at start** (`TP_WARMUP`): the server sends itself one request as soon as its port answers.
+- If you put a queueing proxy in front of the server, do not estimate prompt size from the request body: an
+  inline image is a few hundred to a few thousand tokens, not its base64 length.
+
 ## What did not help
 
 All measured on this setup; the code for the first two is in `experiments/`.
@@ -119,6 +159,10 @@ All measured on this setup; the code for the first two is in `experiments/`.
 - The "mixed context lengths are slow" problem listed here earlier was a misdiagnosis: 13k and 108k requests decode
   together at 66–86 tok/s each. The slow case was a cache eviction followed by a full re-read that starved the other stream.
 - Prompt blocks of 16,384 tokens: no faster than 8,192.
+- Different shares between a loading prompt and active streams (blocks of 1,024 to 4,096 tokens, 250 or 450 ms
+  of decoding in between): within 1% on a replay of image requests next to 2.7k-token text requests.
+- Scoring the long-context index with a plain bf16 matrix product: 1.7 ms per pass faster at 195k tokens, but at
+  lower precision than the current kernel. Not used.
 - Speculation with more than four concurrent requests: extra rows cost memory bandwidth that is already used up.
 
 ## Layout
@@ -155,6 +199,9 @@ installed on both, the checkpoint at the same path on both, and this repository 
    python bench/bench_prose.py   # fresh-prose rate
    python bench/concbench.py     # 1/2/4/8 concurrent requests
    python bench/longbench.py     # long contexts
+   python bench/turnbench.py     # agent-shaped turns on a long cached conversation (CTX, NEW, GROW, EDIT)
+   python bench/mixreal.py       # image workers next to text workers
+   python bench/imgsize.py       # image requests of growing size and count
    ```
 
    The benchmarks default to `localhost:8010` or `localhost:8080`; set `URL` (or `BASE`) and `MODEL`.
