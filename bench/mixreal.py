@@ -4,6 +4,7 @@ import base64, io, json, os, random, time, threading, urllib.request
 from PIL import Image, ImageDraw
 URL = os.environ.get("URL", "http://localhost:8010/v1/chat/completions"); MODEL = os.environ.get("MODEL", "default_model")
 WI = int(os.environ.get("WI", "1")); WT = int(os.environ.get("WT", "1")); DUR = float(os.environ.get("DUR", "60")); PX = int(os.environ.get("PX", "812"))
+SEED = os.environ.get("SEED", "1") == "1"      # the real jobs send a seed with every request; that changes the server's path
 WORDS = [w.strip() for w in open("/usr/share/dict/words") if w.strip().isalpha() and 3 < len(w.strip()) < 10][::37]
 rnd = random.Random(time.time()); lock = threading.Lock(); res = {"image": [], "text": []}
 def image():
@@ -14,6 +15,7 @@ def req(kind):
     if kind == "image": msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": image()}}, {"type": "text", "text": "Describe this image in three sentences."}]}]; mt = 120
     else: msgs = [{"role": "user", "content": "Notes: " + " ".join(rnd.choice(WORDS) for _ in range(1150)) + "\nIgnore the notes and write four paragraphs about rivers."}]; mt = 350
     body = dict(model=MODEL, max_tokens=mt, temperature=0.3, messages=msgs); t = time.time()
+    if SEED: body["seed"] = rnd.randrange(1, 2**31)
     with urllib.request.urlopen(urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600) as r: d = json.loads(r.read())
     return time.time() - t, d["usage"]["completion_tokens"], d["usage"]["prompt_tokens"]
 end = time.time() + DUR

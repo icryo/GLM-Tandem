@@ -241,6 +241,10 @@ def _fmt(logprobs, top_n, tokenizer):
     return _orig_fmt(getattr(logprobs, "_mx", logprobs), top_n, tokenizer)
 S._format_top_logprobs = _fmt
 
+def _seeded_pick(sm, lp, index):
+    tp = sm.tp
+    for f in tp["chain"]: lp = f(lp)
+    return mx.argmax(lp.astype(mx.float32) * (1.0 / tp["temp"]) + _noise(sm.tp_seed, index, lp.shape[-1])[None], axis=-1).astype(mx.uint32)
 def _step(self, _logits_fn=None):
     if not getattr(self, '_tp_stripped', False) and len(self.uids) == 1:
         _strip_padding(self.prompt_cache); self._tp_stripped = True
@@ -267,7 +271,10 @@ def _step(self, _logits_fn=None):
         logits = mx.concatenate(processed_logits, axis=0)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     samplers = [self.fallback_sampler if s is None else s for s in (self.samplers or [None] * len(self.uids))]
-    if not samplers or all(s is samplers[0] for s in samplers):
+    if any(getattr(s, "tp_seed", None) is not None for s in samplers):
+        sampled = mx.concatenate([_seeded_pick(s, logprobs[e : e + 1], len(self.tokens[e]) + 1) if getattr(s, "tp_seed", None) is not None
+                                  else s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0)
+    elif not samplers or all(s is samplers[0] for s in samplers):
         sampled = (samplers[0] if samplers else self.fallback_sampler)(logprobs)
     else:
         sampled = mx.concatenate([s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0)
@@ -286,6 +293,68 @@ def _step(self, _logits_fn=None):
 _plain_step = _step
 _DUMMY_LP = None
 COUPLED = os.environ.get("TP_COUPLED", "1") == "1"
+# A request with a `seed` used to leave the batch path entirely (the stock server runs it alone, one
+# token per pass, no drafts). Every token on the fast paths is argmax(logits / T + noise(seed, output
+# position)), so the client's seed can simply take the place of the random per-request seed: the
+# same seed and prompt then give the same tokens whichever path or batch the request runs in.
+# TP_SEEDED: 0 = stock behaviour (seeded requests leave the batch path), 1 = seeded requests use the
+# fast path and DECODE alone (default; the output for a seed is then exactly repeatable), 2 = seeded
+# requests also share decode steps with other requests (more throughput; under overlap the logits
+# round differently with the batch shape, so near-ties can fall the other way and outputs are not
+# exactly repeatable).
+# Mode 1 only needs the decode steps to be single-stream. Prompts of other requests can still be read
+# in between (a separate forward on separate caches), so a seeded request is admitted like any other
+# and the rule is applied where a request moves from prompt reading to generation (see _seed_gate):
+# it waits there while the generation batch holds, or it is, a request that must decode alone.
+# With TP_PROMPT_CONC > 1 that hand-over is not one request at a time, so mode 1 falls back to
+# running the seeded request with nothing else admitted (the stock "drain" mechanism).
+SEED_MODE = int(os.environ.get("TP_SEEDED", "1"))
+SEEDED = SEED_MODE > 0
+SEED_GATE = SEED_MODE == 1 and int(os.environ.get("TP_PROMPT_CONC", "1")) == 1 and os.environ.get("TP_FAIR", "1") == "1" and os.environ.get("TP_SEED_GATE", "1") == "1"
+def _client_seed(v):
+    return (abs(int(v)) % (1 << 40)) * 4096
+def _smp_seed(sm, default):
+    v = getattr(sm, "tp_seed", None)
+    return default if v is None else v
+_EXCL = {"bg": None, "on": False}
+def _bg_busy():
+    bg = _EXCL["bg"]
+    if bg is None: return False
+    try:
+        return bool(len(bg._unprocessed_sequences) or len(bg._currently_processing) or len(bg._prompt_batch.uids) or len(bg._generation_batch.uids)
+                    or getattr(bg, "_stash", None) is not None or getattr(bg, "_held", None))
+    except Exception:
+        return True
+_orig_insert_segments = G.BatchGenerator.insert_segments
+def _insert_segments_tp(self, *a, **k):
+    _EXCL["bg"] = self
+    return _orig_insert_segments(self, *a, **k)
+G.BatchGenerator.insert_segments = _insert_segments_tp
+def _seed_fast(self, args):
+    """A seeded request the fast path can serve with the client's seed."""
+    if getattr(args, "seed", None) is None or not (SEEDED and COUPLED): return False
+    if not (self.model_provider.is_batchable and self.cli_args.kv_bits is None): return False
+    sp = args.sampling; lg = args.logits
+    # Greedy with a seed: the seed changes nothing, but argmax over 16-bit logits has exact ties that the
+    # slightest rounding difference resolves the other way, and under load the hand-over variant did not
+    # always repeat. It keeps the stock path there (alone, as before); sampled requests are not sensitive.
+    if (sp.temperature or 0.0) == 0: return not SEED_GATE
+    if (getattr(sp, "xtc_probability", 0) or 0) > 0: return False
+    if lg.logit_bias or any((getattr(lg, k, 0) or 0) != 0 for k in ("repetition_penalty", "presence_penalty", "frequency_penalty")): return False
+    return True
+_orig_is_batchable = S.ResponseGenerator._is_batchable
+def _is_batchable_tp(self, args):
+    fast = _seed_fast(self, args)
+    if SEED_MODE == 2 or SEED_GATE: return True if fast else _orig_is_batchable(self, args)
+    if SEED_MODE == 1:
+        busy = _bg_busy()
+        if not busy: _EXCL["on"] = False
+        if _EXCL["on"]: return False                    # a seeded request is running alone: wait for it
+        if fast:                                        # start only on an idle generator, and hold it
+            if not busy: _EXCL["on"] = True
+            return not busy
+    return _orig_is_batchable(self, args)
+S.ResponseGenerator._is_batchable = _is_batchable_tp
 _orig_make_sampler = S._make_sampler
 def _make_sampler_tp(args, tokenizer):
     """Same sampler, plus its parameters so the speculative step can sample with shared noise."""
@@ -298,9 +367,15 @@ def _make_sampler_tp(args, tokenizer):
         if 0 < (sp.top_p or 0) < 1.0: chain.append(lambda x, v=sp.top_p: apply_top_p(x, v))
         if (sp.min_p or 0) != 0.0: chain.append(lambda x, v=sp.min_p: apply_min_p(x, v, 1))
         if (sp.top_k or 0) > 0: chain.append(lambda x, v=sp.top_k: apply_top_k(x, v))
-        try: smp.tp = dict(temp=float(t), chain=chain)
+        try:
+            smp.tp = dict(temp=float(t), chain=chain)
+            if SEEDED and getattr(args, "seed", None) is not None:
+                smp.tp_seed = _client_seed(args.seed); smp.tp_alone = SEED_MODE == 1
         except AttributeError: pass
     elif t == 0:
+        if SEED_MODE == 1 and getattr(args, "seed", None) is not None:
+            smp = (lambda f: (lambda lp: f(lp)))(smp)           # its own object: this request decodes alone
+            smp.tp_alone = True
         try: smp.greedy = True
         except AttributeError: pass
     return smp
@@ -480,6 +555,7 @@ def _want_depth(st):
 FAST2_GATE = float(os.environ.get("TP_FAST2_GATE", "0.60"))   # P(both drafts accepted) above which a queued cycle carries two drafts
 FAST2_PROBE = int(os.environ.get("TP_FAST2_PROBE", "32"))
 CONF_GATE = float(os.environ.get("TP_CONF_GATE", "0.9"))      # keep the second draft when p(draft 1) * p(draft 2) reaches this; < 0 = off
+_SLOG = os.environ.get("TP_SEEDLOG") == "1"
 def _fast_depth(st):
     """Drafts for the next queued cycle: 0 = not a queued cycle, else 1 or 2."""
     if CONF_GATE >= 0 and CHAIN_MAX >= 2: return 2           # always draft two; the gate drops the second
@@ -608,6 +684,7 @@ def _fast_launch(self, st, model, D):
         else:
             lpf = logits.astype(mx.float32)                  # argmax is unchanged by the normalizer
         g = mx.stack([_nz(st, j0 + i, V) for i in range(R_)])
+        if _SLOG: st.__dict__.setdefault("slog", []).append(f"f{j0}x{R_}")
         s_tok = mx.argmax(lpf * (1.0 / tp["temp"]) + g, axis=-1).astype(mx.int32)
         st.coupled = True
     else:
@@ -697,6 +774,7 @@ def _truncate_pre(self, st):
     st.cut += 1
 
 def _fast_cancel(self, st, model):
+    if _SLOG: st.__dict__.setdefault("slog", []).append("CANCEL")
     """A queued cycle whose tokens will never be used (generation stopped): take its rows back out
     of every cache. Its first row was sampled but, as far as the server knows, never fed."""
     fl = st.fl; st.fl = None
@@ -990,7 +1068,12 @@ def _multi_step(self):
     else:
         scale = mx.array([1.0 if k == 0.0 else 1.0 / k for k in kinds], dtype=mx.float32)[:, None]
         w = mx.array([0.0 if k == 0.0 else 1.0 for k in kinds], dtype=mx.float32)[:, None]
-        nxt = mx.argmax(logits.astype(mx.float32) * scale + mx.random.gumbel(logits.shape) * w, axis=-1)
+        g = mx.random.gumbel(logits.shape)
+        sd = [getattr(sm, "tp_seed", None) for sm in samplers]
+        if any(v is not None for v in sd):
+            V = logits.shape[-1]
+            g = mx.stack([g[b] if sd[b] is None else _noise(sd[b], len(self.tokens[b]) + 1, V) for b in range(B)])
+        nxt = mx.argmax(logits.astype(mx.float32) * scale + g * w, axis=-1)
     nxt = nxt.astype(inputs.dtype)
     mx.async_eval(nxt)
     self._current_tokens = inputs
@@ -1248,7 +1331,7 @@ def _ms_next(self):
         B = len(self.uids)
         seeds = bcast(mx.random.randint(0, 2**30, (B,))).tolist()
         ms = self._ms = SimpleNamespace(uids=list(self.uids), d=None, a_vals=None, fl=None, kinds=_ms_kinds(self),
-                                        seeds=[int(x) * 4096 for x in seeds], noise={}, zero=None, busy=False,
+                                        seeds=[_smp_seed(sm, int(x) * 4096) for sm, x in zip((self.samplers or [None] * B), seeds)], noise={}, zero=None, busy=False,
                                         steps=0, emitted=0, offered=0, accepted=0, rejects=0, t0=_pc(), tm=[0.0, 0.0, 0.0], tw=0.0, per=[[0.0, 0], [0.0, 0]], last=None, lastk=0)
     if ms.fl is None: _ms_launch(self, ms)
     _t0 = _pc(); _r0 = ms.rejects
@@ -1326,6 +1409,7 @@ def _mtp_step(self):
         _strip_padding(self.prompt_cache)
         lm = model.language_model
         _seed = int(bcast(mx.random.randint(0, 2**30, (1,))).item()) * 4096
+        _seed = _smp_seed(self.samplers[0] if self.samplers else None, _seed)
         st = self._tpm = SimpleNamespace(pending=[], drafts=None, lm=lm, head=getattr(lm, "mtp", None) is not None,
                                          head_cache=None, uid=self.uids[0], look=None, ema=[0.8, 0.5, 0.35], probe=0, seed=_seed,
                                          pre=None, pre_saved=None, pre_rows=2, a_val=None, conf_next=None, cut=0, noise={}, cand_prev=False, fast=0, fl=None, pos=0, h2=[0, 0, 0], cycles=0, emitted=0, head_off=0, head_acc=0, look_off=0, look_acc=0, look_cycles=0, t0=__import__('time').perf_counter(), tm=[0.0, 0.0, 0.0])
@@ -1370,6 +1454,7 @@ def _mtp_step(self):
         lpf = logprobs
         for f in tp["chain"]: lpf = f(lpf)
         g = mx.stack([_noise(st.seed, j0 + i, V) for i in range(R_)])
+        if _SLOG: st.__dict__.setdefault("slog", []).append(f"s{j0}x{R_}")
         s_tok = mx.argmax(lpf * (1.0 / tp["temp"]) + g, axis=-1).astype(mx.int32)
         st.coupled = True
     else:
@@ -1502,6 +1587,7 @@ def _filter(self, keep):
     _mtp_undo(self)
     st = getattr(self, "_tpm", None)
     if st is not None and not keep:
+        if _SLOG and R == 0 and self.uids and st.uid == self.uids[0]: print(f"[tp-seedlog] seed={st.seed} tokens={self.tokens[0][-st.emitted:] if st.emitted else []} cycles={' '.join(getattr(st, 'slog', []))}", flush=True)
         if st.cycles and os.environ.get("TP_MTP_LOG", "1") == "1" and R == 0:
             print(f"[tp-mtp] coupled={getattr(st, 'coupled', False)} tok={st.emitted} tps={st.emitted/max(__import__('time').perf_counter()-st.t0,1e-6):.1f} cycles={st.cycles} fast={st.fast} chain2={st.h2} cut={st.cut} tok/cycle={st.emitted/max(st.cycles,1):.2f} head {st.head_acc}/{st.head_off} lookup {st.look_acc}/{st.look_off} in {st.look_cycles} cycles | ms/cycle build {1e3*st.tm[0]/st.cycles:.2f} wait {1e3*st.tm[1]/st.cycles:.2f} post {1e3*st.tm[2]/st.cycles:.2f} | cache types {sorted({type(c).__name__ for c in self.prompt_cache})}", flush=True)
         if CONF_LOG and _conf_rows and R == 0:
@@ -1719,13 +1805,90 @@ if os.environ.get("TP_FAIR", "1") == "1":
         self._prompt_batch, self._currently_processing = st
     _F_DBG = os.environ.get("TP_FAIR_DEBUG") == "1"
     _bg_next0 = G.BatchGenerator._next
+    # Requests that must decode alone (seeded, TP_SEEDED=1). A request whose prompt is read (one token
+    # left, which starts generation) is set aside in self._held, in arrival order, while it may not start:
+    # the generation batch holds a decode-alone request, or it is one itself and the batch is not empty,
+    # or somebody is already waiting. The head of the line starts as soon as the rule allows; with an
+    # empty generation batch it always does, so nothing can wait forever.
+    def _alone(sm): return getattr(sm, "tp_alone", False)
+    def _may_start(self, sm):
+        g = self._generation_batch
+        gs = list(g.samplers or [])
+        for d in (getattr(g, "_deferred", None) or []): gs += list(d.samplers or [])     # joining at the next step
+        if not gs and len(g) == 0: return True
+        if len(gs) >= self.completion_batch_size: return False
+        return not _alone(sm) and not any(_alone(x) for x in gs)
+    # A long prompt takes turns with decode-alone requests. Short prompts jump ahead of a long one and no
+    # prompt is read while a decode-alone request generates, so a steady flow of seeded jobs would leave a
+    # long prompt (an agent request) unread for as long as the flow lasts. Each decode-alone generation
+    # therefore owes the long prompt one block (self._long_due) before the next such request starts.
+    def _long_pending(self):
+        if not getattr(self, "_long_due", False): return False
+        st = getattr(self, "_stash", None)
+        return (st is not None and any(_left(q[0]) > _PRE_MAX for q in st[1])) or any(_left(q[0]) > _PRE_MAX for q in self._currently_processing)
+    def _seed_gate(self):
+        held = getattr(self, "_held", None)
+        if held is None: held = self._held = []
+        out = []
+        cp = self._currently_processing
+        if len(cp) == 1 and len(cp[0][0]) == 1 and len(cp[0][0][0]) == 1 and len(self._prompt_batch) == 1:
+            sm = self._prompt_batch.samplers[0] if self._prompt_batch.samplers else None
+            if held or not _may_start(self, sm) or (_alone(sm) and _long_pending(self)):
+                held.append((self._prompt_batch, cp))
+                self._prompt_batch = G.PromptProcessingBatch.empty(self.model, self.sampler, prefill_step_size=self.prefill_step_size)
+                self._currently_processing = []
+        # A queued request with one token left (its prompt is fully cached) would be made into a batch and
+        # start generating inside one stock call, past the check above: take those out of the queue here.
+        if self._unprocessed_sequences and any(len(q[1]) == 1 and len(q[1][0]) == 1 for q in self._unprocessed_sequences):
+            rest = []
+            for q in list(self._unprocessed_sequences):
+                if len(q[1]) == 1 and len(q[1][0]) == 1 and (held or not _may_start(self, q[5]) or (_alone(q[5]) and _long_pending(self))):
+                    cur = self._currently_processing; self._currently_processing = []
+                    self._unprocessed_sequences = type(self._unprocessed_sequences)([q])
+                    pb = self._make_batch(1)
+                    held.append((pb, self._currently_processing)); self._currently_processing = cur
+                else:
+                    rest.append(q)
+            self._unprocessed_sequences = type(self._unprocessed_sequences)(rest)
+        # Arrival order. While a decode-alone request generates no prompts are read, so requests that arrive
+        # with their prompt already cached, or that were read earlier, could keep passing one whose prompt
+        # still has to be read. The head of the line therefore also waits for any earlier request (lower uid)
+        # with a short prompt left to read; long prompts are exempt, as with TP_PREEMPT.
+        if len(held) > 1: held.sort(key=lambda h: h[0].uids[0])
+        while held:
+            pb, cp = held[0]
+            if not _may_start(self, pb.samplers[0] if pb.samplers else None): break
+            if _alone(pb.samplers[0] if pb.samplers else None) and _long_pending(self): break
+            u0 = pb.uids[0]
+            if any(u < u0 and 1 < _left(q[0]) <= _PRE_MAX for u, q in zip(self._prompt_batch.uids, self._currently_processing)) \
+               or any(q[0] < u0 and 1 < _left(q[1]) <= _PRE_MAX for q in self._unprocessed_sequences): break
+            held.pop(0)
+            last = [cp[0][0][0]]; prog = (cp[0][2],) * 2
+            gen = pb.split([0]).generate(last)
+            out.append(G.PromptProcessingBatch.Response(gen.uids[0], prog, True, True))
+            self._generation_batch.extend(gen)
+        return out
     def _bg_next(self):
+        if SEED_GATE:
+            pre = _seed_gate(self)
+            if pre:
+                r = _bg_next1(self)
+                return pre + list(r[0]), r[1]
+        return _bg_next1(self)
+    def _bg_next1(self):
+        if SEED_GATE and len(self._generation_batch) > 0 and any(_alone(x) for x in (self._generation_batch.samplers or [])):
+            # A decode-alone request is generating: no prompt blocks in between either (they shift its
+            # cycles, and with them the rounding). It is short work; the prompts resume right after.
+            self._long_due = True
+            tic = _pc(); r = self._generation_batch.next()
+            self._counters.decode_time += _pc() - tic; self._counters.generation_tokens += len(r); self._counters.generation_steps += 1
+            return [], r
         st = getattr(self, "_stash", None)
         if _F_DBG: print(f"[tp-fair] gen={len(self._generation_batch)} cur={[_left(q[0]) for q in self._currently_processing]} wait={[_left(q[1]) for q in self._unprocessed_sequences]} stash={st is not None}", flush=True)
         if st is not None:
-            if len(self._prompt_batch) == 0 and not self._currently_processing and not _promote_small(self):
+            if len(self._prompt_batch) == 0 and not self._currently_processing and (_long_pending(self) or not _promote_small(self)):
                 self._prompt_batch, self._currently_processing = st; self._stash = None
-        elif (_PRE and self._unprocessed_sequences and self._currently_processing
+        elif (_PRE and self._unprocessed_sequences and self._currently_processing and not _long_pending(self)
               and any(_left(seq[0]) > _PRE_MAX for seq in self._currently_processing) and _promote_small(self)):
             self._stash = (self._prompt_batch, self._currently_processing)
             self._prompt_batch = G.PromptProcessingBatch.empty(self.model, self.sampler, prefill_step_size=self.prefill_step_size)
@@ -1742,7 +1905,9 @@ if os.environ.get("TP_FAIR", "1") == "1":
         else:
             step = _F_FULL
         self.prefill_step_size = step; self._prompt_batch.prefill_step_size = step
+        was_long = any(_left(seq[0]) > _PRE_MAX for seq in self._currently_processing)
         p0 = self._counters.prompt_tokens; r = _bg_next0(self)
+        if was_long and self._counters.prompt_tokens > p0: self._long_due = False
         if self._counters.prompt_tokens - p0 >= 256: _F_BREAK[0] = True
         return r
     # In distributed mode the server calls next() a fixed number of times (tuned so decode steps fill
@@ -1756,8 +1921,24 @@ if os.environ.get("TP_FAIR", "1") == "1":
         return _tb_next0(self)
     S.TimeBudget.__next__ = _tb_next
     _bg_remove0 = G.BatchGenerator.remove; _bg_extract0 = G.BatchGenerator.extract_cache
+    def _held_each(self, fn):
+        """Run fn with each set-aside (held) prompt batch swapped in as the current one."""
+        held = getattr(self, "_held", None) or []
+        for i in range(len(held)):
+            cur = (self._prompt_batch, self._currently_processing)
+            self._prompt_batch, self._currently_processing = held[i]
+            try: fn()
+            finally:
+                held[i] = (self._prompt_batch, self._currently_processing)
+                self._prompt_batch, self._currently_processing = cur
+        if held: self._held = [h for h in held if len(h[0]) > 0]
     def _bg_remove(self, uids, return_prompt_caches=False):
         r = _bg_remove0(self, uids, return_prompt_caches)
+        if getattr(self, "_held", None):
+            acc = {}
+            if return_prompt_caches: _held_each(self, lambda: acc.update(_bg_extract0(self, uids)))
+            _held_each(self, lambda: _bg_remove0(self, uids, False))
+            if acc: r = {**acc, **(r or {})}
         if getattr(self, "_stash", None) is not None:
             _swap(self)
             try: r2 = _bg_remove0(self, uids, return_prompt_caches)
@@ -1766,6 +1947,9 @@ if os.environ.get("TP_FAIR", "1") == "1":
         return r
     def _bg_extract(self, uids):
         r = _bg_extract0(self, uids)
+        if getattr(self, "_held", None):
+            rest = [u for u in uids if u not in r]
+            if rest: _held_each(self, lambda: r.update(_bg_extract0(self, rest)))
         if getattr(self, "_stash", None) is not None:
             rest = [u for u in uids if u not in r]
             if rest:

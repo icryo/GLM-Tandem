@@ -63,6 +63,25 @@ layer scores all pooled keys of the context (compute-bound). Splitting that acro
 
 Vision costs 1.05 GiB per Mac and nothing during decoding.
 
+**Requests that send a `seed`** (replay of real non-streaming JSON-mode jobs, temperature 0.25 and 0.8, about
+2.7k tokens in and 370 out, or one image in and 100–150 out; output tokens/s over the whole run, prompt time included)
+
+| Workers | Stock path | `TP_SEEDED=1` (default) | `TP_SEEDED=2` |
+|---|---|---|---|
+| 1 | 73 | 95 | 95 |
+| 2 | 73 | 95 | 108 |
+| 4 | 76 | 97 | 129 |
+| Median time of the 2.7k-token job, one worker | 5.2 s | 3.9 s | 3.9 s |
+| Two image workers and one text worker, all seeded (`bench/mixreal.py`) | 71 | 85 | 99 |
+| Same seed and prompt give the same output | yes | yes, alone and under load | alone yes; under overlap only about 1 output in 10 |
+| Short seeded job arriving 3 s into a 94k-token prompt | 39 s | 2.5 s | not measured |
+| Streaming request (about 12k-token prompt) next to two seeded job workers: first token, median / worst (`bench/agentmix.py`) | 12.5 / 15.3 s | 9.1 / 9.2 s | 5.7 / 7.5 s |
+| Same test: seeded jobs finished in 70 s, median time | 11, 15.5 s | 12, 14.3 s | 14, 10.3 s |
+
+The stock server takes any request with a `seed` out of the batch path: it runs alone, one token per pass,
+without the draft head, and nothing else is admitted until it ends. Clients that send a seed with every
+request (many do by default) never saw the numbers above this table.
+
 ## Known problems
 
 - **A long prompt and active streams share the machine about half and half.** The prompt loads at roughly half
@@ -73,6 +92,11 @@ Vision costs 1.05 GiB per Mac and nothing during decoding.
 - **An image prompt is read without yielding to active streams**: up to about 1.4 s per 4,096 image tokens.
 - **Two prompts cannot be read as one batch** (`TP_PROMPT_CONC` must stay 1): the padded batch path calls
   `finalize()` on a cache slot this model never fills, and padding through the linear-attention state is unverified.
+- **Seeded requests do not share decode steps by default** (`TP_SEEDED=1`), so several seeded jobs at once are
+  no faster in total than one after another. `TP_SEEDED=2` lets them share (129 instead of 97 tok/s at four
+  workers) but then the output for a seed is not exactly repeatable under overlap: logits are 16-bit, they round
+  differently with the batch shape, and near-ties fall the other way. Greedy requests show the same effect, so
+  `temperature=0` output also depends on what else is running. Greedy requests with a seed keep the stock path.
 - **Long context costs a flat 7 ms per pass at 195k tokens** (12 ms per pass at short context), whatever the number of rows.
 - **No prompt reuse when two prompts diverge mid-message.** The linear-attention state cannot be rewound, so
   reuse only happens at the end of a system or user message.
@@ -127,6 +151,19 @@ Vision costs 1.05 GiB per Mac and nothing during decoding.
     12% of its length, answer-end entries that can no longer match are dropped, and system-prompt checkpoints are
     evicted last (`TP_CACHE_THIN`, `TP_CACHE_SPACING`).
 16. **Image prompts in blocks of up to 4,096 tokens** instead of 1,024, because of the fixed cost per block.
+17. **Seeded requests on the fast path.** Every token on the fast paths is already
+    `argmax(logits / T + noise(seed, output position))` with a per-request seed, so the client's seed replaces
+    the random one and a seeded request gets drafts like any other. To keep its output repeatable it decodes
+    alone: it is admitted and its prompt is read like any other request's, and the rule applies where a request
+    moves from prompt reading to generation. It waits there while the generation batch is not empty; while it
+    generates, other requests wait there too and no prompt blocks are read (reading another prompt between its
+    decode steps was enough to change its output). The line at that hand-over is in arrival order, and its head
+    also waits for an earlier request whose short prompt is still unread; without that, requests arriving with a
+    cached prompt kept passing one that needed reading. A long prompt gets one block after every decode-alone
+    generation; without that a steady flow of seeded jobs kept a streaming request's prompt unread (first token
+    after 16 s median, 34 s worst, in the test above). `bench/seedtest.py` checks repeats alone and under mixed load,
+    `bench/seedecho.py` checks that no request gets another's answer, `bench/seedwait.py` measures the wait behind
+    a long prompt.
 
 ## Staying up
 
@@ -200,7 +237,12 @@ installed on both, the checkpoint at the same path on both, and this repository 
    python bench/concbench.py     # 1/2/4/8 concurrent requests
    python bench/longbench.py     # long contexts
    python bench/turnbench.py     # agent-shaped turns on a long cached conversation (CTX, NEW, GROW, EDIT)
-   python bench/mixreal.py       # image workers next to text workers
+   python bench/mixreal.py       # image workers next to text workers (sends a seed per request; SEED=0 for none)
+   python bench/seedtest.py      # same seed and prompt repeat exactly, alone and under mixed load
+   python bench/seedecho.py      # seeded and unseeded requests at once: nobody gets another's answer
+   python bench/seedwait.py      # a short seeded job arriving while a long prompt is read
+   python bench/agentmix.py      # a streaming request every few seconds next to seeded job workers
+   python bench/seedreplay.py    # replay saved request bodies (SET=file.jsonl, W workers, TEXTOUT to compare runs with cmptext.py)
    python bench/imgsize.py       # image requests of growing size and count
    ```
 

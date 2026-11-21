@@ -6,6 +6,7 @@ TOPICS = ["the history of the bicycle", "how tides work", "the invention of the 
 def one(i, res):
     body = dict(model=MODEL, stream=True, stream_options={"include_usage": True}, max_tokens=300, temperature=float(os.environ.get("TEMP", "0.6")),
                 messages=[{"role": "user", "content": f"Write a detailed essay on {TOPICS[i % len(TOPICS)]} (variant {time.time()})."}])
+    if os.environ.get("SEED") == "1": body["seed"] = 1000 + i + int(time.time())
     t0 = time.time(); first = None; usage = {}
     try:
         with urllib.request.urlopen(urllib.request.Request(URL, json.dumps(body).encode(), {"Content-Type": "application/json"}), timeout=600) as r:
