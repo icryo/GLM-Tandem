@@ -5,7 +5,7 @@
 # For GLM-5.3 the cluster model class is text-only, so this adds the three missing pieces on
 # every rank: the vision tower (1.05 GiB), the image processor, and the embedding splice.
 # The tower runs once per image at prompt time; decoding is unchanged.
-import json, os
+import copy, json, os
 import numpy as np
 import mlx.core as mx
 
@@ -138,6 +138,18 @@ def install(S, model, model_path, rank):
         _FT = os.environ.get('TP_VIS_FAILTEST', '')
         _VBLK = int(os.environ.get('TP_VIS_BLOCK', os.environ.get('TP_PREFILL_STEP', '4096')))
         _VT = os.environ.get('TP_TRACE') == '1'; _MERGE = os.environ.get('TP_VISION_MERGE', '1') == '1'
+        _PIN = os.environ.get('TP_IMG_PIN', '1') == '1'; _PIN_MIN = int(os.environ.get('TP_IMG_PIN_MIN', '16000'))
+        _PIN_BACK = int(os.environ.get('TP_IMG_PIN_BACK', '2048')); _PINLOG = os.environ.get('TP_PINLOG') == '1'
+        if not hasattr(S, '_tp_pins'): S._tp_pins = set()
+        _ut = []
+        def _user_tok(tokenizer):
+            if not _ut:
+                try:
+                    t = tokenizer.convert_tokens_to_ids('<|user|>'); u = getattr(tokenizer, 'unk_token_id', None)
+                    _ut.append(int(t) if isinstance(t, int) and t >= 0 and t != u else None)
+                except Exception:
+                    _ut.append(None)
+            return _ut[0]
         def _tokenize(self, tokenizer, request, args):
             _t = [__import__('time').perf_counter()]
             def _lap(nm):
@@ -157,6 +169,22 @@ def install(S, model, model_path, rank):
             if _MERGE: end = max(end, len(prompt) - 1)
             cache, rest = self.prompt_cache.fetch_nearest_cache(mkey, key[:end])
             done = end - len(rest)
+            # Checkpoint before the oldest image (TP_IMG_PIN=1). A client that keeps only its last few
+            # images removes the oldest image message whenever it adds one; every saved end-of-prompt state
+            # then contains a removed image, so the whole conversation was read again (55-70 s at 150k+
+            # tokens, on the generation thread, with every other request waiting). The state at the start
+            # of the oldest image's message stays valid after that removal: save it while passing.
+            pin = None
+            if _PIN and rest:
+                try:
+                    s0 = min(int(i) for i in vision.starts); c = None; ut = _user_tok(tokenizer)
+                    if ut is not None:
+                        for j in range(s0 - 1, max(s0 - _PIN_BACK, 0) - 1, -1):
+                            if prompt[j] == ut: c = j; break
+                    if c is None: c = s0 - 256
+                    if c >= _PIN_MIN and done < c < end: pin = c
+                except Exception as e:
+                    print(f'[tp-vis] pin skipped: {e!r}', flush=True)
             if rest:
                 if cache is None:
                     cache = make_prompt_cache(mdl)
@@ -188,11 +216,19 @@ def install(S, model, model_path, rank):
                     try:
                         # One block of up to TP_PREFILL_STEP tokens: every forward of 130+ rows costs a fixed
                         # ~200 ms (one pass over all expert weights), so 1,024-token blocks paid it per block.
-                        for a in range(0, end - done, _VBLK):
-                            b = min(a + _VBLK, end - done)
+                        a = 0; total = end - done; cut = pin - done if pin is not None else -1
+                        while a < total:
+                            b = min(a + _VBLK, total)
+                            if a < cut < b: b = cut
                             trunk(toks[None, a:b], cache=cache, inputs_embeds=emb[None, a:b])
                             mx.eval([c.state for c in cache])
                             _beat()
+                            if b == cut:
+                                cp = copy.deepcopy(cache); mx.eval([c.state for c in cp])
+                                S._tp_pins.add((pin, tuple(key[pin - 8:pin])))
+                                self.prompt_cache.insert_cache(mkey, key[:pin], cp, cache_type="user")
+                                if _VT or _PINLOG: print(f'[tp-vis] pin saved at {pin} of {len(prompt)} (read from {done})', flush=True)
+                            a = b
                     except Exception as e:
                         # Mid-trunk the ranks are no longer in step; nothing can be recovered. Exit so the
                         # supervisor restarts both ranks instead of leaving a server that never answers.
@@ -204,6 +240,7 @@ def install(S, model, model_path, rank):
                 else:
                     prefill()
                 _lap('trunk prefill %d tok' % (end - done))
+                if _PINLOG: print(f'[tp-vis] read {end - done} of {len(prompt)} tokens (cached {done}), pin {pin}', flush=True)
                 self.prompt_cache.insert_cache(mkey, key[:end], cache, cache_type="user")
             segs, o = [], 0
             for sg in segments:

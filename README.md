@@ -89,7 +89,17 @@ request (many do by default) never saw the numbers above this table.
 - **Prompts are still read one at a time.** A short one jumps ahead of a long one (`TP_PREEMPT`), two long ones queue.
 - **Reading 130 or more tokens costs a fixed 200 ms** (one pass over all expert weights) plus 0.3 ms per token;
   below that, about 2 ms per token. Every turn and every image request pays it once. Not fixable in software here.
-- **An image prompt is read without yielding to active streams**: up to about 1.4 s per 4,096 image tokens.
+- **A prompt that contains an image is read in one go, and nothing else runs meanwhile.** Everything up to the
+  last image is read before the request enters the scheduler, so a first read of a 150k-token conversation with
+  images holds every other request for about a minute. Later turns read only what is new.
+- **A client that keeps only its last few images** removes the oldest image message each time it adds one,
+  10–16k tokens before the end. Every saved end-of-prompt state then contains a removed image, so the server
+  read the whole conversation again on each such turn (57 s at 148k tokens). `TP_IMG_PIN` (default on) saves the
+  state at the start of the oldest image's message while passing it: that turn now takes 5–7 s alone and 5–16 s
+  under mixed load, and a job arriving during it waits about 7 s instead of the whole read. Costs one extra
+  cache entry per long conversation. Other mid-history edits still re-read from the last saved point before them.
+- **A request naming an unknown model, sent straight to the server port,** makes the stock server try to load it
+  and the watchdog restarts both ranks. The gateway maps model names, so this needs direct access to :8010.
 - **Two prompts cannot be read as one batch** (`TP_PROMPT_CONC` must stay 1): the padded batch path calls
   `finalize()` on a cache slot this model never fills, and padding through the linear-attention state is unverified.
 - **Seeded requests do not share decode steps by default** (`TP_SEEDED=1`), so several seeded jobs at once are

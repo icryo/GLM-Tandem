@@ -1681,8 +1681,15 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
     _pc_init = _PC.__init__
     def _pc_init2(self, max_size=10, max_bytes=1 << 63): _pc_init(self, 1 << 40, 1 << 63)
     _PC.__init__ = _pc_init2
+    # Pinned entries (S._tp_pins, set by the image path): the state just before the oldest image of a long
+    # conversation. Thinning keeps the newest one per conversation and byte eviction takes them last.
+    def _pinned(it):
+        p = getattr(S, "_tp_pins", None)
+        return bool(p) and (len(it[1]), tuple(it[1][-8:])) in p
     def _pc_drop(self, i):
         model, tokens = self._lru.pop(i); e = self._trie.pop(model, tokens)
+        p = getattr(S, "_tp_pins", None)
+        if p: p.discard((len(tokens), tuple(tokens[-8:])))
         self._n_bytes -= e.nbytes; self._n_bytes_by_type[e.cache_type] -= e.nbytes
     # Which long entries to keep (TP_CACHE_THIN=1). One turn of a 170k-token conversation stores two
     # entries of ~2.3 GB each (end of the user message, end of the answer) and nothing removed the earlier
@@ -1709,13 +1716,19 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
         if not anc: return
         anc.sort(key=lambda it: -len(it[1])); drop = []
         space = max(_C_SMALL, int(_C_SPACING * n)); mark = n
+        seen_pin = False
         for j, it in enumerate(anc):
+            if _pinned(it):
+                if seen_pin: drop.append(it)                 # an older pin of the same conversation
+                seen_pin = True; continue
             if j == 0: continue                              # the checkpoint the next turn starts from
             if len(it[1]) <= mark - space: mark = len(it[1])
             else: drop.append(it)
-        parent = anc[0][1]
+        parent = anc[0][1]; ppin = _pinned(anc[0])
         for it in items[:-1]:
-            if (it[0] == model and it[2] == "assistant" and len(it[1]) > len(parent) and it not in anc
+            # Entries that continue from the parent but not into the new entry can never match again: answers
+            # sent back in another form, and (after a pin) the whole old tail whose image was removed.
+            if (it[0] == model and (it[2] == "assistant" or (ppin and it[2] != "system")) and len(it[1]) > len(parent) and it not in anc
                     and not _pc_is_prefix(tokens, it[1]) and _pc_is_prefix(parent, it[1])):
                 drop.append(it)
         for it in drop:
@@ -1730,16 +1743,24 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
             try: _pc_thin(self, model, tokens)
             except Exception as e: print(f"[tp-cache] thinning skipped: {e!r}", flush=True)
         while self._n_bytes > _C_BYTES and len(o) > 1:
-            i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system"), -1)
+            i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system" and not _pinned(it)), -1)
+            if i < 0: i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system"), -1)
             if i < 0: i = o.oldest(False)                # only system prompts and the new entry are long
             if i < 0 or i == len(o) - 1: i = 0           # no other long entry left: oldest of any kind
             if i == len(o) - 1: break                    # never the entry just inserted
             _pc_drop(self, i)
     _PC.insert_cache = _pc_insert2
+    if os.environ.get("TP_CACHELOG") == "1":
+        def _pc_insert3(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+            _pc_insert2(self, model, tokens, prompt_cache, cache_type=cache_type)
+            print(f"[tp-cachelog] insert {cache_type} {len(tokens)} | bytes {self._n_bytes / 2**30:.1f} GiB | entries "
+                  + " ".join(f"{it[2][0]}{len(it[1])}{'*' if _pinned(it) else ''}" for it in self._lru._items if len(it[1]) >= _C_SMALL), flush=True)
+        _PC.insert_cache = _pc_insert3
     _pc_fetch = _PC.fetch_nearest_cache
     def _pc_fetch2(self, model, tokens):
         cache, rest = _pc_fetch(self, model, tokens)
         if cache is not None: self._lru.touch(model, tokens[:len(tokens) - len(rest)])
+        if os.environ.get("TP_CACHELOG") == "1" and len(tokens) >= _C_SMALL: print(f"[tp-cachelog] fetch {len(tokens)} -> reuse {len(tokens) - len(rest)}", flush=True)
         return cache, rest
     _PC.fetch_nearest_cache = _pc_fetch2
     def _pc_trim_to(self, *, n_sequences=None, n_bytes=None): pass
