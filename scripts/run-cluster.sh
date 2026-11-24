@@ -32,8 +32,9 @@ set +e
 $SELF 'pkill -f "python3 tpserve.py"; true' 2>/dev/null
 $REMOTE 'pkill -f "python3 tpserve.py"; true' 2>/dev/null
 sleep 2
-child=0; peer=0
+child=0; peer=0; mon=0
 cleanup() {
+  [ $mon -ne 0 ] && kill $mon 2>/dev/null      # the peer monitor below must not outlive this script's server
   [ $peer -ne 0 ] && kill $peer 2>/dev/null
   $SELF 'pkill -f "python3 tpserve.py"; true' 2>/dev/null
   [ $child -ne 0 ] && kill $child 2>/dev/null
@@ -51,6 +52,7 @@ peer=$!
 # as soon as rank 1's session ends so a supervisor restarts both. Does nothing once this script has exited.
 me=$$
 { while kill -0 $peer 2>/dev/null; do sleep 2; done; kill -0 $me 2>/dev/null && $SELF 'pkill -f "python3 tpserve.py"; true' 2>/dev/null; } &
+mon=$!
 wait $child
 code=$?
 cleanup

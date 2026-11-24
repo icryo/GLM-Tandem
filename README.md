@@ -89,17 +89,29 @@ request (many do by default) never saw the numbers above this table.
 - **Prompts are still read one at a time.** A short one jumps ahead of a long one (`TP_PREEMPT`), two long ones queue.
 - **Reading 130 or more tokens costs a fixed 200 ms** (one pass over all expert weights) plus 0.3 ms per token;
   below that, about 2 ms per token. Every turn and every image request pays it once. Not fixable in software here.
-- **A prompt that contains an image is read in one go, and nothing else runs meanwhile.** Everything up to the
-  last image is read before the request enters the scheduler, so a first read of a 150k-token conversation with
-  images holds every other request for about a minute. Later turns read only what is new.
+- **A prompt that contains an image is read outside the scheduler.** Everything up to the last image is read
+  before the request enters it. Reads of up to 40k tokens (`TP_VIS_ASYNC_MIN`) happen in one go and nothing else
+  runs meanwhile: an image swap on a 200k-token conversation holds other requests for 7–8 s. Longer reads take
+  turns with everything else (`TP_VIS_ASYNC`, default on): one 2,048-token block between rounds of decode steps
+  while streams are active, two full blocks in the gap after each seeded job. A first read of a 205k-token
+  conversation takes 78 s alone, as before, and 130–150 s next to continuous streams or a steady flow of seeded
+  jobs; in exchange the other requests keep moving (new streams start in 2–4 s instead of waiting up to 80 s,
+  the longest job wait fell from about 84 s to 17 s). Job throughput during the read is unchanged.
+- **Streams that decode together share padded caches, so a long conversation decodes almost alone.** Every
+  stream in a batch gets an attention cache as long as the longest context in it. One 207k-token conversation
+  decoding next to eight short requests took active memory from 96 to 212 GiB and hung both ranks; this
+  happened five times in one evening of real traffic before it was understood. A request now joins the batch
+  only while streams × longest context stays within `TP_BATCH_SLOTS` (250,000 tokens); otherwise it waits in
+  line, in arrival order. With that limit the same load peaks at 121 GiB. In the traffic this was built for,
+  96 of 14,590 requests overlapped the generation of a conversation that long, so few requests ever wait.
 - **A client that keeps only its last few images** removes the oldest image message each time it adds one,
   10–16k tokens before the end. Every saved end-of-prompt state then contains a removed image, so the server
   read the whole conversation again on each such turn (57 s at 148k tokens). `TP_IMG_PIN` (default on) saves the
   state at the start of the oldest image's message while passing it: that turn now takes 5–7 s alone and 5–16 s
   under mixed load, and a job arriving during it waits about 7 s instead of the whole read. Costs one extra
   cache entry per long conversation. Other mid-history edits still re-read from the last saved point before them.
-- **A request naming an unknown model, sent straight to the server port,** makes the stock server try to load it
-  and the watchdog restarts both ranks. The gateway maps model names, so this needs direct access to :8010.
+- **The server port serves one model name, `default_model`.** Any other name is refused with an error (the
+  stock server would try to load it, which took both ranks down). The gateway maps model names.
 - **Two prompts cannot be read as one batch** (`TP_PROMPT_CONC` must stay 1): the padded batch path calls
   `finalize()` on a cache slot this model never fills, and padding through the linear-attention state is unverified.
 - **Seeded requests do not share decode steps by default** (`TP_SEEDED=1`), so several seeded jobs at once are
@@ -131,7 +143,9 @@ request (many do by default) never saw the numbers above this table.
 6. **The draft head is split across both Macs** like a trunk layer, so neither waits while the other drafts.
 7. **Concurrent requests are rows of one fused pass**, not a batch (`kdaseq.py` gives the linear-attention
    kernel a sequence axis). With 2–4 requests each one also carries its own draft and emits one or two tokens
-   per step.
+   per step, while streams × longest context is at most 200,000 tokens (`TP_MSPEC_SLOTS`): past that, taking a
+   rejected draft row out of the padded caches costs more than the second token gains (6% faster at 2 × 70k tokens,
+   3–6% slower at 2 × 117k and 2 × 207k).
 8. **Drafts copied from the context.** When the last few tokens also appear earlier in the context, the tokens
    that followed them there are offered as a draft, up to 7 at a time (`TP_LOOKUP`, on by default). Every
    drafted token is still verified, so the output does not change. This is where the 210–219 tok/s on code
@@ -189,7 +203,12 @@ request (many do by default) never saw the numbers above this table.
 - **The launcher stops rank 0 when rank 1's session ends**, so recovery does not wait for the watchdog. Measured
   by killing rank 1 under a supervisor that restarts the launcher on exit: answering again after 39 s (183 s with
   the watchdog alone).
-- **Warm-up at start** (`TP_WARMUP`): the server sends itself one request as soon as its port answers.
+- **Warm-up at start** (`TP_WARMUP`): the server sends itself one request as soon as its port answers, then two
+  at once and one with a small image, so those kernels are compiled before real traffic.
+- **A start that hangs is caught too.** The loop watchdog only arms on the loop's first turn; a separate deadline
+  (`TP_WATCHDOG_START_S`, 900 s) covers the link to the other rank and loading.
+- **Memory is logged** (`TP_MEMLOG=<seconds>`): active, pooled and peak MLX memory on each rank.
+- **Connection bursts** are queued (`TP_ACCEPT_QUEUE`, 128) instead of reset by the stock accept queue of 5.
 - If you put a queueing proxy in front of the server, do not estimate prompt size from the request body: an
   inline image is a few hundred to a few thousand tokens, not its base64 length.
 
@@ -211,6 +230,14 @@ All measured on this setup; the code for the first two is in `experiments/`.
 - Scoring the long-context index with a plain bf16 matrix product: 1.7 ms per pass faster at 195k tokens, but at
   lower precision than the current kernel. Not used.
 - Speculation with more than four concurrent requests: extra rows cost memory bandwidth that is already used up.
+- Joining the two halves of the vocabulary logits with a per-rank argmax and a two-number gather instead of
+  gathering the full rows (`bench/gatherbench.py`): 0.47–0.67 ms against 0.39–0.61 ms for 1–8 rows. The cost is
+  the round trip, not the megabyte of payload.
+- The two-row vocabulary-head kernel for three and four rows: prose 140 instead of 142 tok/s, two streams 161
+  instead of 169.
+- Letting the hyper-connection post kernel run without its ordering dependency: 140 against 142 tok/s.
+- Capping MLX's buffer pool: the pool stayed under 35 GiB through every failure; the memory that ran out was live
+  (see the padded batch caches under Known problems).
 
 ## Layout
 

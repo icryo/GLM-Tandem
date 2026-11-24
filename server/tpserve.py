@@ -5,6 +5,17 @@ import mlx.core as mx
 # The generation thread shares the interpreter with the HTTP threads; a 5 ms switch interval lets one
 # of them hold it for a whole GPU-idle stretch.
 sys.setswitchinterval(float(os.environ.get("TP_SWITCH", "0.0002")))
+# A start that hangs (the link to the other rank, loading) is not seen by the generation-loop watchdog
+# further down, which only arms on the loop's first turn: give the start its own deadline.
+_boot = [False]
+if float(os.environ.get("TP_WATCHDOG_S", "150")) > 0:
+    def _boot_wd(limit=float(os.environ.get("TP_WATCHDOG_START_S", "900"))):
+        import time
+        time.sleep(limit)
+        if not _boot[0]:
+            print(f"[tp] fatal: the generation loop did not start within {limit:.0f} s; exiting so the supervisor restarts the server", flush=True)
+            os._exit(73)
+    import threading; threading.Thread(target=_boot_wd, daemon=True).start()
 g = mx.distributed.init(strict=True, backend=os.environ.get("TP_BACKEND", "jaccl"))
 _all_sum = mx.distributed.all_sum
 def all_sum(x, *args, **kwargs):
@@ -537,7 +548,7 @@ def _dump_cache(self):
         seen.add(key); print(f"[tp-cache] layer {i}: {d(c)[:700]}", flush=True)
 CHAIN_GATE = float(os.environ.get("TP_CHAIN_GATE", "0.8" if PREK > 0 else "0.55"))
 PROBE_EVERY = int(os.environ.get("TP_PROBE_EVERY", "48"))
-_KG = os.environ.get("MLX_KGAP") is not None or os.environ.get("MLX_KPROF") is not None
+_KG = os.environ.get("MLX_KGAP") is not None or os.environ.get("MLX_KPROF") is not None   # the patched MLX treats any value, "0" included, as on
 def _kgap_mark(name):
     """Profiling build only: reset or dump the GPU idle-gap recorder."""
     k = mx.fast.metal_kernel(name=name, input_names=["a"], output_names=["out"], source="out[0] = a[0];")
@@ -1135,6 +1146,7 @@ def _extend(self, batch):
 # sparse and head caches trim per row). A stream emits one or two tokens per step.
 MSPEC = os.environ.get("TP_MSPEC", "1") == "1"
 MSPEC_MAX = int(os.environ.get("TP_MSPEC_MAX", "4"))
+MSPEC_SLOTS = int(os.environ.get("TP_MSPEC_SLOTS", "200000"))
 HEAD_ROWS = os.environ.get("TP_HEAD_ROWS", "1") == "1"
 def _ms_kinds(self):
     B = len(self.uids)
@@ -1151,6 +1163,11 @@ def _ms_eligible(self):
     if not (MSPEC and _multi.get("kda_seq") is not None and "head" in _shared): return False
     if not 2 <= len(self.uids) <= MSPEC_MAX: return False
     if getattr(self, "_deferred", None) or any(self.logits_processors): return False
+    # A rejected draft row is taken out of the padded key caches of the whole batch (_trim_rows), a copy
+    # that grows with streams x longest context (~5 ms per such step at 2 x 117k tokens). Measured with one
+    # long stream and one short one: two-token steps win by 6% at 2 x 70k and lose by 3-6% at 2 x 117k and
+    # 2 x 207k. Past TP_MSPEC_SLOTS the batch decodes one token per step.
+    if MSPEC_SLOTS > 0 and len(self.uids) * max(len(t) for t in self.tokens) > MSPEC_SLOTS: return False
     return _ms_kinds(self) is not None
 
 def _ms_noise(ms, b, idx, V):
@@ -1750,9 +1767,27 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
             if i == len(o) - 1: break                    # never the entry just inserted
             _pc_drop(self, i)
     _PC.insert_cache = _pc_insert2
+    def _true_bytes(obj):
+        """Bytes of every array reachable from a cache object (nbytes of some cache classes leaves arrays out)."""
+        seen = set(); tot = 0; by = {}; stack = [(obj, "")]
+        while stack:
+            o, nm = stack.pop()
+            if id(o) in seen: continue
+            seen.add(id(o))
+            if isinstance(o, mx.array):
+                tot += o.nbytes; by[nm] = by.get(nm, 0) + o.nbytes
+            elif isinstance(o, (list, tuple)): stack.extend((x, nm) for x in o)
+            elif isinstance(o, dict): stack.extend((x, f"{nm}.{k}" if isinstance(k, str) else nm) for k, x in o.items())
+            elif hasattr(o, "__dict__") and not isinstance(o, type) and not callable(o): stack.extend((x, f"{type(o).__name__}.{k}") for k, x in vars(o).items())
+        return tot, by
+    S._tp_true_bytes = _true_bytes
     if os.environ.get("TP_CACHELOG") == "1":
         def _pc_insert3(self, model, tokens, prompt_cache, *, cache_type="assistant"):
             _pc_insert2(self, model, tokens, prompt_cache, cache_type=cache_type)
+            if len(tokens) >= _C_SMALL:
+                tb, by = _true_bytes(prompt_cache)
+                print(f"[tp-cachelog] entry {len(tokens)}: counted {sum(c.nbytes for c in prompt_cache) / 2**30:.2f} GiB, arrays {tb / 2**30:.2f} GiB, active {mx.get_active_memory() / 2**30:.1f} | "
+                      + ", ".join(f"{k} {v / 2**30:.2f}" for k, v in sorted(by.items(), key=lambda kv: -kv[1])[:8]), flush=True)
             print(f"[tp-cachelog] insert {cache_type} {len(tokens)} | bytes {self._n_bytes / 2**30:.1f} GiB | entries "
                   + " ".join(f"{it[2][0]}{len(it[1])}{'*' if _pinned(it) else ''}" for it in self._lru._items if len(it[1]) >= _C_SMALL), flush=True)
         _PC.insert_cache = _pc_insert3
@@ -1824,7 +1859,7 @@ if os.environ.get("TP_FAIR", "1") == "1":
     def _swap(self):
         st = self._stash; self._stash = (self._prompt_batch, self._currently_processing)
         self._prompt_batch, self._currently_processing = st
-    _F_DBG = os.environ.get("TP_FAIR_DEBUG") == "1"
+    _F_DBG = os.environ.get("TP_FAIR_DEBUG") == "1"; _SLOTLOG = os.environ.get("TP_SLOTLOG") == "1"
     _bg_next0 = G.BatchGenerator._next
     # Requests that must decode alone (seeded, TP_SEEDED=1). A request whose prompt is read (one token
     # left, which starts generation) is set aside in self._held, in arrival order, while it may not start:
@@ -1832,18 +1867,30 @@ if os.environ.get("TP_FAIR", "1") == "1":
     # or somebody is already waiting. The head of the line starts as soon as the rule allows; with an
     # empty generation batch it always does, so nothing can wait forever.
     def _alone(sm): return getattr(sm, "tp_alone", False)
-    def _may_start(self, sm):
+    # Streams that decode together share padded caches: every stream's attention cache is as long as the
+    # longest context in the batch. One 200k-token conversation decoding with eight short requests cost over
+    # 100 GiB that way and ran both machines out of memory (Nov 23-24). A request therefore only joins while
+    # streams x longest context stays within TP_BATCH_SLOTS tokens; otherwise it waits in line (self._held),
+    # in arrival order, like a decode-alone request. A lone stream of any length always starts.
+    _SLOTS = int(os.environ.get("TP_BATCH_SLOTS", "250000"))
+    def _ctx(batch): return max((len(t) for t in (getattr(batch, "tokens", None) or [])), default=0)
+    def _may_start(self, sm, ctx=0):
         g = self._generation_batch
-        gs = list(g.samplers or [])
-        for d in (getattr(g, "_deferred", None) or []): gs += list(d.samplers or [])     # joining at the next step
+        gs = list(g.samplers or []); lens = [len(t) for t in (g.tokens or [])]
+        for d in (getattr(g, "_deferred", None) or []):                                  # joining at the next step
+            gs += list(d.samplers or []); lens += [len(t) for t in (d.tokens or [])]
         if not gs and len(g) == 0: return True
         if len(gs) >= self.completion_batch_size: return False
+        if _SLOTS > 0 and lens and (len(lens) + 1) * max(max(lens), ctx) > _SLOTS:
+            if _F_DBG or _SLOTLOG: print(f"[tp-slots] waiting: {len(lens)} streams up to {max(lens)} tokens, candidate {ctx}", flush=True)
+            return False
         return not _alone(sm) and not any(_alone(x) for x in gs)
     # A long prompt takes turns with decode-alone requests. Short prompts jump ahead of a long one and no
     # prompt is read while a decode-alone request generates, so a steady flow of seeded jobs would leave a
     # long prompt (an agent request) unread for as long as the flow lasts. Each decode-alone generation
     # therefore owes the long prompt one block (self._long_due) before the next such request starts.
     def _long_pending(self):
+        if getattr(S, "_tp_vjob_due", False): return True     # a held-back image-prompt read (tpvision) is owed a block
         if not getattr(self, "_long_due", False): return False
         st = getattr(self, "_stash", None)
         return (st is not None and any(_left(q[0]) > _PRE_MAX for q in st[1])) or any(_left(q[0]) > _PRE_MAX for q in self._currently_processing)
@@ -1854,7 +1901,7 @@ if os.environ.get("TP_FAIR", "1") == "1":
         cp = self._currently_processing
         if len(cp) == 1 and len(cp[0][0]) == 1 and len(cp[0][0][0]) == 1 and len(self._prompt_batch) == 1:
             sm = self._prompt_batch.samplers[0] if self._prompt_batch.samplers else None
-            if held or not _may_start(self, sm) or (_alone(sm) and _long_pending(self)):
+            if held or not _may_start(self, sm, _ctx(self._prompt_batch) + 1) or (_alone(sm) and _long_pending(self)):
                 held.append((self._prompt_batch, cp))
                 self._prompt_batch = G.PromptProcessingBatch.empty(self.model, self.sampler, prefill_step_size=self.prefill_step_size)
                 self._currently_processing = []
@@ -1863,7 +1910,7 @@ if os.environ.get("TP_FAIR", "1") == "1":
         if self._unprocessed_sequences and any(len(q[1]) == 1 and len(q[1][0]) == 1 for q in self._unprocessed_sequences):
             rest = []
             for q in list(self._unprocessed_sequences):
-                if len(q[1]) == 1 and len(q[1][0]) == 1 and (held or not _may_start(self, q[5]) or (_alone(q[5]) and _long_pending(self))):
+                if len(q[1]) == 1 and len(q[1][0]) == 1 and (held or not _may_start(self, q[5], len(q[4] or []) + 1) or (_alone(q[5]) and _long_pending(self))):
                     cur = self._currently_processing; self._currently_processing = []
                     self._unprocessed_sequences = type(self._unprocessed_sequences)([q])
                     pb = self._make_batch(1)
@@ -1878,7 +1925,7 @@ if os.environ.get("TP_FAIR", "1") == "1":
         if len(held) > 1: held.sort(key=lambda h: h[0].uids[0])
         while held:
             pb, cp = held[0]
-            if not _may_start(self, pb.samplers[0] if pb.samplers else None): break
+            if not _may_start(self, pb.samplers[0] if pb.samplers else None, _ctx(pb) + 1): break
             if _alone(pb.samplers[0] if pb.samplers else None) and _long_pending(self): break
             u0 = pb.uids[0]
             if any(u < u0 and 1 < _left(q[0]) <= _PRE_MAX for u, q in zip(self._prompt_batch.uids, self._currently_processing)) \
@@ -1964,7 +2011,7 @@ if os.environ.get("TP_FAIR", "1") == "1":
             _swap(self)
             try: r2 = _bg_remove0(self, uids, return_prompt_caches)
             finally: _swap(self)
-            if r2: r = {**r2, **r}
+            if r2: r = {**r2, **(r or {})}
         return r
     def _bg_extract(self, uids):
         r = _bg_extract0(self, uids)
@@ -2060,7 +2107,7 @@ _WD = float(os.environ.get("TP_WATCHDOG_S", "150"))
 if _WD > 0:
     import threading as _th, time as _tm
     _wd_last = [None]
-    def _tp_beat(): _wd_last[0] = _tm.monotonic()
+    def _tp_beat(): _wd_last[0] = _tm.monotonic(); _boot[0] = True
     S._tp_beat = _tp_beat
     _RGc = next(c for c in vars(S).values() if isinstance(c, type) and "_generate" in vars(c) and "_next_request" in vars(c))
     _wd_nr = _RGc._next_request
@@ -2158,8 +2205,18 @@ if _CLEAR_MIN > 0:
     G.PromptProcessingBatch.prompt = _pp_prompt
 
 try:
-    info = mx.device_info(); mx.set_cache_limit(int(info["memory_size"]))
+    info = mx.device_info()
+    _pool = os.environ.get("TP_MLX_CACHE_GB")
+    mx.set_cache_limit(int(info["memory_size"]) if _pool is None else int(float(_pool) * 2**30))
 except Exception: pass
+if os.environ.get("TP_MEMLOG"):
+    def _memlog():
+        import time as _t
+        while True:
+            _t.sleep(float(os.environ["TP_MEMLOG"]))
+            try: print(f"[tp-mem r{g.rank()}] {_t.strftime('%H:%M:%S')} active {mx.get_active_memory() / 2**30:.1f} pool {mx.get_cache_memory() / 2**30:.1f} peak {mx.get_peak_memory() / 2**30:.1f} GiB", flush=True)
+            except Exception as e: print(f"[tp-mem] {e!r}", flush=True)
+    import threading as _mth; _mth.Thread(target=_memlog, daemon=True).start()
 sys.argv = ["mlx_lm.server", "--model", path, "--host", "0.0.0.0", "--port", os.environ.get("TP_PORT", "8010"),
             "--max-tokens", "32768", "--decode-concurrency", os.environ.get("TP_CONC", "1"), "--prompt-concurrency", os.environ.get("TP_PROMPT_CONC", os.environ.get("TP_CONC", "1")),
             # Same template settings the single-box oMLX deployment used (model_settings.json).
@@ -2177,8 +2234,36 @@ if os.environ.get("TP_WARMUP", "1") == "1" and g.rank() == 0:
             _t.sleep(1)
             try:
                 t = _t.time(); _u.urlopen(_u.Request(url, body, {"Content-Type": "application/json"}), timeout=300).read()
-                print(f"[tp] warm-up request done in {_t.time() - t:.1f} s", flush=True); return
+                print(f"[tp] warm-up request done in {_t.time() - t:.1f} s", flush=True); break
             except Exception:
                 pass
+        else: return
+        if os.environ.get("TP_WARMUP2", "1") != "1": return
+        # The kernels for several streams at once and for images compile on first use too (~15 s each).
+        try:
+            import base64 as _b, struct as _s, zlib as _z, threading as _h
+            t = _t.time()
+            def _post(b):
+                try: _u.urlopen(_u.Request(url, _j.dumps(b).encode(), {"Content-Type": "application/json"}), timeout=300).read()
+                except Exception as e: print(f"[tp] warm-up extra request failed: {e!r}", flush=True)
+            two = [_h.Thread(target=_post, args=(dict(model="default_model", max_tokens=24, temperature=tmp, messages=[{"role": "user", "content": f"Count from {i + 1} to 12."}]),)) for i, tmp in enumerate((0, 0.6))]
+            [x.start() for x in two]; [x.join() for x in two]
+            w = 112; raw = b"".join(b"\x00" + bytes((x * 2 + y) % 256 for x in range(w) for _ in range(3)) for y in range(w))
+            ch = lambda k, d: _s.pack(">I", len(d)) + k + d + _s.pack(">I", _z.crc32(k + d) & 0xffffffff)
+            png = b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", _s.pack(">IIBBBBB", w, w, 8, 2, 0, 0, 0)) + ch(b"IDAT", _z.compress(raw)) + ch(b"IEND", b"")
+            _post(dict(model="default_model", max_tokens=8, temperature=0, messages=[{"role": "user", "content": [
+                {"type": "text", "text": "One word: what is this?"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _b.b64encode(png).decode()}}]}]))
+            print(f"[tp] warm-up for two streams and an image done in {_t.time() - t:.1f} s", flush=True)
+        except Exception as e: print(f"[tp] warm-up extras skipped: {e!r}", flush=True)
     import threading as _wth; _wth.Thread(target=_warm, daemon=True).start()
+# One model only: the stock server would try to load any other name a request carries (on rank 0 alone,
+# which ends with both ranks down). Refuse it instead.
+_mp_load0 = S.ModelProvider.load
+def _mp_load(self, model_path, adapter_path=None, draft_model_path=None):
+    if self.model_key is not None:
+        key = (self._model_map.get(model_path, model_path), self._adapter_map.get(model_path, adapter_path), self._draft_model_map.get(draft_model_path, draft_model_path))
+        if key != self.model_key: raise ValueError(f"unknown model {model_path!r}: this server serves one model, use 'default_model'")
+    return _mp_load0(self, model_path, adapter_path, draft_model_path)
+S.ModelProvider.load = _mp_load
+S.ThreadingHTTPServer.request_queue_size = int(os.environ.get("TP_ACCEPT_QUEUE", "128"))   # stock: 5, bursts of connections were reset
 S.main()
