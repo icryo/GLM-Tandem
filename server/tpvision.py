@@ -137,7 +137,7 @@ def install(S, model, model_path, rank):
         _beat = getattr(S, '_tp_beat', lambda: None)
         _FT = os.environ.get('TP_VIS_FAILTEST', '')
         _VBLK = int(os.environ.get('TP_VIS_BLOCK', os.environ.get('TP_PREFILL_STEP', '4096')))
-        _VT = os.environ.get('TP_TRACE') == '1'; _MERGE = os.environ.get('TP_VISION_MERGE', '1') == '1'
+        _VT = os.environ.get('TP_TRACE') in ('1', '2'); _MERGE = os.environ.get('TP_VISION_MERGE', '1') == '1'
         _PIN = os.environ.get('TP_IMG_PIN', '1') == '1'; _PIN_MIN = int(os.environ.get('TP_IMG_PIN_MIN', '16000'))
         _PIN_BACK = int(os.environ.get('TP_IMG_PIN_BACK', '2048')); _PINLOG = os.environ.get('TP_PINLOG') == '1'
         if not hasattr(S, '_tp_pins'): S._tp_pins = set()

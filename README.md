@@ -119,9 +119,27 @@ request (many do by default) never saw the numbers above this table.
   workers) but then the output for a seed is not exactly repeatable under overlap: logits are 16-bit, they round
   differently with the batch shape, and near-ties fall the other way. Greedy requests show the same effect, so
   `temperature=0` output also depends on what else is running. Greedy requests with a seed keep the stock path.
+  What mode 1 costs in waiting, from one day of real traffic where every job carries a seed: a job that arrives
+  while one other request is in flight takes 1.4–2.4 s longer than one that arrives alone, 3.4–5.3 s longer with
+  two or more in flight (a quarter of all job seconds), and a stream's first token comes after 4.5 s instead of
+  1.0 s (medians). Two defects that only showed in mode 2 are fixed: the `TP_BATCH_SLOTS` memory rule was
+  enforced by the mode-1 hand-over line and was silently off in mode 2, and a `stop` string could end the
+  server (see "Staying up").
 - **Long context costs a flat 7 ms per pass at 195k tokens** (12 ms per pass at short context), whatever the number of rows.
 - **No prompt reuse when two prompts diverge mid-message.** The linear-attention state cannot be rewound, so
-  reuse only happens at the end of a system or user message.
+  reuse only happens at a saved state: the end of a system or user message of an earlier request, or a pin.
+  How a client's history changes between turns therefore decides its waiting time. In 1,336 streamed turns of
+  real agent traffic, 89% only appended. 38 replaced the last one to three messages (a chat client that adds
+  two short messages after each answer and takes them out again on the next turn): each of those re-read the
+  whole conversation, 8–13 s at 22–34k tokens and up to 185 s at 194k, because cache thinning kept only the
+  newest saved state and that one lay after the change. The two newest are kept now (`TP_CACHE_KEEP_LAST`, see
+  "What makes it fast" 15) and such a turn starts in 0.3–0.5 s. 59 changed earlier history. Of those, large
+  rewrites (12–60k new tokens in a 70–196k prompt) already start within about 6 s of what reading the new part
+  alone would take; small sub-conversations that branch off a shared 11–20k history still re-read all of it
+  (6–13 s each, and eight at once queue behind each other). Saving a state where a new prompt leaves a stored
+  one would fix that; not built.
+- **A restart loses every saved state.** The next turn of each long conversation reads it again from the start
+  (100 s at 194k tokens, longer if two such reads overlap). Nothing is written to disk.
 - **Tied to oMLX 0.8.0rc1.** The server patches oMLX's GLM runtime at load time by rewriting its source, with
   assertions on every anchor. A different oMLX version will most likely fail those assertions at start-up.
 - The fresh-prose rate is limited by the draft head: about 77–79% of its drafts are accepted, and that matches
@@ -173,7 +191,11 @@ request (many do by default) never saw the numbers above this table.
 14. **The lookup index is kept between turns** and its first build is one numpy pass (44 ms per turn before).
 15. **Cache entries are chosen, not just aged.** Earlier checkpoints of the same conversation are thinned to one per
     12% of its length, answer-end entries that can no longer match are dropped, and system-prompt checkpoints are
-    evicted last (`TP_CACHE_THIN`, `TP_CACHE_SPACING`).
+    evicted last (`TP_CACHE_THIN`, `TP_CACHE_SPACING`). The two newest checkpoints of a conversation always stay
+    (`TP_CACHE_KEEP_LAST`): a client that takes its last messages out again diverges just before the newest one.
+    The extra copy, and checkpoints on a branch the conversation has left, are the first to go when the cache is
+    over its byte limit, so they never cost another conversation its place. `bench/cachesim.py` runs the policy
+    on stand-in caches without a model; `bench/rewindconv.py` measures the turn on a live server.
 16. **Image prompts in blocks of up to 4,096 tokens** instead of 1,024, because of the fixed cost per block.
 17. **Seeded requests on the fast path.** Every token on the fast paths is already
     `argmax(logits / T + noise(seed, output position))` with a per-request seed, so the client's seed replaces
@@ -211,6 +233,24 @@ request (many do by default) never saw the numbers above this table.
 - **Connection bursts** are queued (`TP_ACCEPT_QUEUE`, 128) instead of reset by the stock accept queue of 5.
 - If you put a queueing proxy in front of the server, do not estimate prompt size from the request body: an
   inline image is a few hundred to a few thousand tokens, not its base64 length.
+- **A `stop` string cannot end the server any more.** With two-token steps a request can return two responses
+  from one step. The stock loop ends a request on the first response whose text completes a stop string,
+  forgets it, and then looks it up again for the second response: `KeyError`, the generation thread dies and
+  the server exits. Second responses are now handed out on the next call and dropped if their request is gone
+  (`TP_ONE_RESP`, default on). `bench/stoptest.py` sends stop-string requests next to another stream: the
+  second-response case came up in 16 of 36 of them.
+- **The memory rule does not depend on the seeded mode.** The line that enforces `TP_BATCH_SLOTS` runs whenever
+  that limit is set.
+- **Pauses are logged.** A generation loop that does not turn for more than 8 s prints `[tp] loop pause N s`
+  (`TP_WATCHDOG_GAPLOG`); the longest ones seen in normal operation say how far `TP_WATCHDOG_S` can come down.
+  `TP_TRACE=2` prints a few timing lines per request (tokenizing, cache lookup and insert, image tower, prompt
+  read) without the per-step lines of `TP_TRACE=1`.
+- **A proxy in front should hold requests while the server restarts.** Ours restarted the server five seconds
+  after an exit but kept sending requests to the closed port meanwhile: 26 jobs failed with 502 in one
+  35-second restart. `gateway/hold-and-retry.diff` (against our aiohttp gateway, not part of this repo) makes it
+  hold new requests until the server answers again and send a request once more when its connection failed
+  before any answer. Against a stand-in upstream that is killed mid-run (`gateway/fake_upstream.py`,
+  `gateway/client.py`): 9 of 10 requests fail before, none after.
 
 ## What did not help
 
@@ -248,6 +288,7 @@ All measured on this setup; the code for the first two is in `experiments/`.
 | `mlx/` | The MLX patch and how to build it |
 | `bench/` | Benchmarks and correctness checks |
 | `experiments/` | Negative results kept for reference |
+| `gateway/` | A patch for a proxy in front of the server (hold and retry while the server restarts) and its stand-in test |
 
 ## Running it
 

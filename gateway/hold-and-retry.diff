@@ -1,0 +1,115 @@
+--- a/gateway/app.py	2026-10-04 19:10:48
++++ b/gateway/app.py	2026-11-24 13:13:29
+@@ -69,7 +69,7 @@
+         if cfg.supervisor.enabled:
+             s = cfg.supervisor
+             self.supervisor = Supervisor(s.command, s.env, s.log_file, s.stop_timeout_s)
+-            self.supervisor.on_exit = lambda code: self.metrics.event("upstream_exit", code=code)
++            self.supervisor.on_exit = self._upstream_exited
+         self.session: aiohttp.ClientSession | None = None
+         self.inflight: dict[int, Inflight] = {}
+         self.ready = asyncio.Event()
+@@ -106,6 +106,47 @@
+         if self.session:
+             await self.session.close()
+ 
++    def _upstream_exited(self, code) -> None:
++        """The upstream stopped by itself (crash, or its own watchdog). The supervisor starts it again in
++        5 s; until it answers, new requests wait in _admit (streams get keep-alive pings) instead of
++        being sent to a closed port and failing with 502. Its prompt cache is gone, so forget the prefix
++        estimates as well."""
++        self.metrics.event("upstream_exit", code=code)
++        if self.restart_lock.locked():
++            return  # a restart the gateway started handles readiness itself
++        self.ready.clear()
++        self.upstream_state = f"restarting (exited with code {code})"
++        self.tracker.forget()
++        asyncio.create_task(self._after_exit())
++
++    async def _after_exit(self) -> None:
++        await asyncio.sleep(6)  # the supervisor waits 5 s before it starts the process again
++        ok = await self._wait_healthy(self.cfg.supervisor.ready_timeout_s)
++        if self.restart_lock.locked():
++            return
++        self.upstream_state = "healthy" if ok else "unhealthy after exit"
++        self.ready.set()
++        if ok:
++            self.metrics.event("upstream_ready", after="exit")
++
++    async def _wait_upstream_back(self, request, rec, api, client, limit_s: float):
++        """After a failed connection: wait until the upstream answers again. Returns (client, ok)."""
++        t0 = last_ping = time.monotonic()
++        await asyncio.sleep(1.0)  # let the supervisor notice the exit and clear `ready`
++        while True:
++            if self.ready.is_set() and await self._health_ok():
++                return client, True
++            now = time.monotonic()
++            if now - t0 > limit_s or self.client_gone(request):
++                return client, False
++            if rec.stream and client is None and now - t0 >= self.cfg.admission.early_sse_after_s:
++                client = await self._start_sse(request)
++                rec.early_sse = True
++            if client is not None and now - last_ping >= self.cfg.admission.ping_interval_s:
++                await client.write(ANTHROPIC_PING if api == "anthropic" else COMMENT_PING)
++                last_ping = now
++            await asyncio.sleep(1.0)
++
+     async def _bring_up(self) -> None:
+         timeout = self.cfg.supervisor.ready_timeout_s
+         if await self._wait_healthy(timeout):
+@@ -296,12 +337,26 @@
+         return resp
+ 
+     async def _forward(self, request, raw, rec, inf, client, api, started) -> web.StreamResponse:
+-        try:
+-            upstream = await self.session.post(self.url(request.path, request.query_string),
+-                                               data=raw, headers=self.upstream_headers(request))
+-        except (aiohttp.ClientError, OSError) as exc:
+-            rec.status, rec.error = 502, f"upstream unreachable: {exc}"
+-            return await self._fail(client, api, 502, rec.error)
++        retries = self.cfg.upstream.retries
++        while True:
++            try:
++                upstream = await self.session.post(self.url(request.path, request.query_string),
++                                                   data=raw, headers=self.upstream_headers(request))
++                break
++            except (aiohttp.ClientError, OSError) as exc:
++                # Nothing of an answer has reached the client yet (a JSON answer arrives whole, and a
++                # stream fails here only before its headers). The upstream died or is restarting: wait
++                # for it and send the request again instead of failing it.
++                if retries > 0:
++                    retries -= 1
++                    rec.retries += 1
++                    client, ok = await self._wait_upstream_back(request, rec, api, client,
++                                                                self.cfg.upstream.retry_wait_s)
++                    if ok:
++                        inf.sent_at = time.monotonic()
++                        continue
++                rec.status, rec.error = 502, f"upstream unreachable: {exc}"
++                return await self._fail(client, api, 502, rec.error)
+         inf.upstream = upstream
+         rec.status = upstream.status
+         try:
+--- a/gateway/config.py	2026-10-04 19:10:48
++++ b/gateway/config.py	2026-11-24 13:13:29
+@@ -37,6 +37,10 @@
+     connect_timeout_s: float = 10.0
+     # Top-level fields removed from /v1/messages bodies before forwarding (for upstream 400s).
+     strip_fields: list[str] = field(default_factory=list)
++    # A request whose connection to the upstream fails before any answer (upstream crashed or is
++    # restarting) waits up to retry_wait_s for it to come back and is sent again, this many times.
++    retries: int = 1
++    retry_wait_s: float = 240.0
+ 
+ 
+ @dataclass
+--- a/gateway/metrics.py	2026-10-04 17:22:38
++++ b/gateway/metrics.py	2026-11-24 13:13:29
+@@ -41,6 +41,7 @@
+     decode_tps: float | None = None
+     error: str = ""
+     probe: bool = False
++    retries: int = 0
+ 
+     def finish(self, started: float, sent: float, first_token: float | None, ended: float) -> None:
+         """started: request arrived; sent: forwarded upstream (after any queueing)."""

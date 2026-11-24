@@ -1707,6 +1707,10 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
         model, tokens = self._lru.pop(i); e = self._trie.pop(model, tokens)
         p = getattr(S, "_tp_pins", None)
         if p: p.discard((len(tokens), tuple(tokens[-8:])))
+        sp = getattr(S, "_tp_spare", None)
+        if sp: sp.discard((len(tokens), tuple(tokens[-8:])))
+        sp = getattr(S, "_tp_stale", None)
+        if sp: sp.discard((len(tokens), tuple(tokens[-8:])))
         self._n_bytes -= e.nbytes; self._n_bytes_by_type[e.cache_type] -= e.nbytes
     # Which long entries to keep (TP_CACHE_THIN=1). One turn of a 170k-token conversation stores two
     # entries of ~2.3 GB each (end of the user message, end of the answer) and nothing removed the earlier
@@ -1722,7 +1726,20 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
     #  - system-prompt entries are evicted last.
     # Prefix tests sample the boundary instead of comparing every token: a wrong guess only changes what
     # is kept, never what is served (lookups stay exact).
+    #  - the TP_CACHE_KEEP_LAST (2) longest of them always stay. A chat client that appends side messages to
+    #    a turn and takes them out again on the next one (seen live: two short user messages added after
+    #    each answer, removed ~170 tokens back on the following turn) diverges just before the newest
+    #    checkpoint; with only that one kept, every such turn re-read the whole conversation (8-13 s at
+    #    22-34k tokens). The extra copies (S._tp_spare) are the first to go when the cache is over its
+    #    byte limit, so they never cost another conversation its place.
     _C_THIN = os.environ.get("TP_CACHE_THIN", "1") == "1"; _C_SPACING = float(os.environ.get("TP_CACHE_SPACING", "0.12"))
+    _C_KEEP = max(1, int(os.environ.get("TP_CACHE_KEEP_LAST", "2")))
+    if not hasattr(S, "_tp_spare"): S._tp_spare = set()
+    # Checkpoints left on a branch the conversation has moved away from (S._tp_stale) go before either: they
+    # are kept while there is room (a client may run several branches off one history) but each is a full
+    # copy, and thirty turns of a 190k-token conversation would otherwise push live entries out.
+    if not hasattr(S, "_tp_stale"): S._tp_stale = set()
+    def _sig(tokens): return (len(tokens), tuple(tokens[-8:]))
     def _pc_is_prefix(short, long_):
         n = len(short)
         if n >= len(long_): return False
@@ -1733,21 +1750,25 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
         if not anc: return
         anc.sort(key=lambda it: -len(it[1])); drop = []
         space = max(_C_SMALL, int(_C_SPACING * n)); mark = n
-        seen_pin = False
+        seen_pin = False; kept = 1
         for j, it in enumerate(anc):
             if _pinned(it):
                 if seen_pin: drop.append(it)                 # an older pin of the same conversation
                 seen_pin = True; continue
-            if j == 0: continue                              # the checkpoint the next turn starts from
-            if len(it[1]) <= mark - space: mark = len(it[1])
-            else: drop.append(it)
+            if j == 0:                                       # the checkpoint the next turn starts from
+                S._tp_spare.discard(_sig(it[1])); continue
+            if len(it[1]) <= mark - space: mark = len(it[1]); S._tp_spare.discard(_sig(it[1]))
+            elif kept < _C_KEEP: S._tp_spare.add(_sig(it[1]))
+            else: drop.append(it); continue
+            kept += 1
         parent = anc[0][1]; ppin = _pinned(anc[0])
         for it in items[:-1]:
             # Entries that continue from the parent but not into the new entry can never match again: answers
             # sent back in another form, and (after a pin) the whole old tail whose image was removed.
-            if (it[0] == model and (it[2] == "assistant" or (ppin and it[2] != "system")) and len(it[1]) > len(parent) and it not in anc
+            if (it[0] == model and it[2] != "system" and len(it[1]) > len(parent) and it not in anc
                     and not _pc_is_prefix(tokens, it[1]) and _pc_is_prefix(parent, it[1])):
-                drop.append(it)
+                if it[2] == "assistant" or ppin: drop.append(it)
+                else: S._tp_stale.add(_sig(it[1]))
         for it in drop:
             i = o._find(it[0], it[1])
             if i >= 0 and i != len(o) - 1: _pc_drop(self, i)
@@ -1760,7 +1781,9 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
             try: _pc_thin(self, model, tokens)
             except Exception as e: print(f"[tp-cache] thinning skipped: {e!r}", flush=True)
         while self._n_bytes > _C_BYTES and len(o) > 1:
-            i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system" and not _pinned(it)), -1)
+            i = next((j for j, it in enumerate(o._items[:-1]) if _sig(it[1]) in S._tp_stale), -1) if S._tp_stale else -1
+            if i < 0 and S._tp_spare: i = next((j for j, it in enumerate(o._items[:-1]) if _sig(it[1]) in S._tp_spare), -1)
+            if i < 0: i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system" and not _pinned(it)), -1)
             if i < 0: i = next((j for j, it in enumerate(o._items[:-1]) if len(it[1]) >= _C_SMALL and it[2] != "system"), -1)
             if i < 0: i = o.oldest(False)                # only system prompts and the new entry are long
             if i < 0 or i == len(o) - 1: i = 0           # no other long entry left: oldest of any kind
@@ -1794,7 +1817,9 @@ if os.environ.get("TP_CACHE_POLICY", "1") == "1":
     _pc_fetch = _PC.fetch_nearest_cache
     def _pc_fetch2(self, model, tokens):
         cache, rest = _pc_fetch(self, model, tokens)
-        if cache is not None: self._lru.touch(model, tokens[:len(tokens) - len(rest)])
+        if cache is not None:
+            self._lru.touch(model, tokens[:len(tokens) - len(rest)])
+            if S._tp_stale: S._tp_stale.discard(_sig(tokens[:len(tokens) - len(rest)]))
         if os.environ.get("TP_CACHELOG") == "1" and len(tokens) >= _C_SMALL: print(f"[tp-cachelog] fetch {len(tokens)} -> reuse {len(tokens) - len(rest)}", flush=True)
         return cache, rest
     _PC.fetch_nearest_cache = _pc_fetch2
@@ -1936,8 +1961,11 @@ if os.environ.get("TP_FAIR", "1") == "1":
             out.append(G.PromptProcessingBatch.Response(gen.uids[0], prog, True, True))
             self._generation_batch.extend(gen)
         return out
+    # The line is also what enforces TP_BATCH_SLOTS, so it runs whenever that limit is set, not only while
+    # seeded requests decode alone (with TP_SEEDED=2 the memory rule was silently off: found 2026-11-24).
+    _GATE = SEED_GATE or (_SLOTS > 0 and int(os.environ.get("TP_PROMPT_CONC", "1")) == 1 and os.environ.get("TP_SEED_GATE", "1") == "1")
     def _bg_next(self):
-        if SEED_GATE:
+        if _GATE:
             pre = _seed_gate(self)
             if pre:
                 r = _bg_next1(self)
@@ -2107,7 +2135,11 @@ _WD = float(os.environ.get("TP_WATCHDOG_S", "150"))
 if _WD > 0:
     import threading as _th, time as _tm
     _wd_last = [None]
-    def _tp_beat(): _wd_last[0] = _tm.monotonic(); _boot[0] = True
+    _WD_GAP = float(os.environ.get("TP_WATCHDOG_GAPLOG", "8"))       # log pauses longer than this (evidence for a tighter TP_WATCHDOG_S)
+    def _tp_beat():
+        n = _tm.monotonic(); t = _wd_last[0]
+        if t is not None and n - t > _WD_GAP: print(f"[tp] loop pause {n - t:.1f} s", flush=True)
+        _wd_last[0] = n; _boot[0] = True
     S._tp_beat = _tp_beat
     _RGc = next(c for c in vars(S).values() if isinstance(c, type) and "_generate" in vars(c) and "_next_request" in vars(c))
     _wd_nr = _RGc._next_request
@@ -2134,15 +2166,50 @@ if _WD > 0:
                 os._exit(72)
     _th.Thread(target=_wd_loop, daemon=True).start()
 
+# ---- One response per request per call (TP_ONE_RESP=1) ---------------------------------------------
+# With two-token steps (multi-stream speculation) a request can return two responses from one step. The
+# server's loop ends a request on the first response whose text completes a `stop` string and forgets it,
+# then looks the request up again for the second response: KeyError, the generation thread dies and the
+# server exits (seen once, 2026-11-24: a request with a stop string sharing a batch with another stream).
+# Hand the second responses out on the next call instead; those of a request removed meanwhile are dropped.
+if os.environ.get("TP_ONE_RESP", "1") == "1":
+    _or_next = G.BatchGenerator._next; _or_remove = G.BatchGenerator.remove
+    def _or_bg_next(self, *a, **k):
+        q = getattr(self, "_tp_second", None)
+        if q:
+            self._tp_second = None
+            return [], q
+        pr, gr = _or_next(self, *a, **k)
+        if len(gr) > 1:
+            seen = set(); first = []; second = []
+            for r in gr:
+                if r.uid in seen: second.append(r)
+                else: seen.add(r.uid); first.append(r)
+            if second:
+                self._tp_second = second; gr = first
+        return pr, gr
+    def _or_bg_remove(self, uids, return_prompt_caches=False):
+        q = getattr(self, "_tp_second", None)
+        if q:
+            gone = set(uids); keep = [r for r in q if r.uid not in gone]
+            if len(keep) < len(q) and R == 0: print(f"[tp] second response of a removed request dropped ({len(q) - len(keep)})", flush=True)
+            self._tp_second = keep or None
+        return _or_remove(self, uids, return_prompt_caches)
+    G.BatchGenerator._next = _or_bg_next; G.BatchGenerator.remove = _or_bg_remove
+
 # ---- Request-path trace (TP_TRACE=1): where the time before the first token goes --------------------
-if os.environ.get("TP_TRACE") == "1" and g.rank() == 0:
+# TP_TRACE=2: the same without the per-step lines (a few lines per request; cheap enough to leave on).
+if os.environ.get("TP_TRACE") in ("1", "2") and g.rank() == 0:
     import time as _tt
-    _T0 = [_tt.perf_counter()]
-    def _tr(name, cls, attr, extra=None):
+    _T0 = [_tt.perf_counter()]; _TR1 = os.environ.get("TP_TRACE") == "1"
+    def _safe(info, a, k, r):
+        try: return info(a, k, r) if info else ''
+        except Exception: return ''
+    def _tr(name, cls, attr, extra=None, info=None):
         f0 = getattr(cls, attr)
         def w(*a, **k):
             t = _tt.perf_counter(); r = f0(*a, **k); d = _tt.perf_counter() - t
-            if d > 0.002 or extra: print(f"[tp-trace] +{1e3 * (t - _T0[0]):8.1f} ms {name:22s} {1e3 * d:7.1f} ms {extra(a, k, r) if extra else ''}", flush=True)
+            if d > (0.002 if _TR1 else 0.02) or extra: print(f"[tp-trace] +{1e3 * (t - _T0[0]):8.1f} ms {name:22s} {1e3 * d:7.1f} ms {extra(a, k, r) if extra else _safe(info, a, k, r)}", flush=True)
             return r
         setattr(cls, attr, w)
     _RGc = next(c for c in vars(S).values() if isinstance(c, type) and "_tokenize" in vars(c) and "_generate" in vars(c))
@@ -2153,13 +2220,14 @@ if os.environ.get("TP_TRACE") == "1" and g.rank() == 0:
     def _nr(self, timeout=None):
         t = _tt.perf_counter(); r = _nr0(self, timeout)
         if r is not None:
-            print(f"[tp-trace] ---- request shared in {1e3 * (_tt.perf_counter() - t):.1f} ms (includes idle wait up to 100 ms)", flush=True); _T0[0] = _tt.perf_counter()
+            if _TR1: print(f"[tp-trace] ---- request shared in {1e3 * (_tt.perf_counter() - t):.1f} ms (includes idle wait up to 100 ms)", flush=True)
+            _T0[0] = _tt.perf_counter()
         return r
     _RGc._next_request = _nr
-    _tr("tokenize", _RGc, "_tokenize")
-    _tr("cache fetch", S.LRUPromptCache, "fetch_nearest_cache")
-    _tr("cache insert", S.LRUPromptCache, "insert_cache")
-    _tr("batch.next", G.BatchGenerator, "_next", lambda a, k, r: f"prompt_resp={len(r[0])} gen_resp={len(r[1])} cur={[sum(len(x) for x in q[0]) for q in a[0]._currently_processing]}")
+    _tr("tokenize", _RGc, "_tokenize", info=lambda a, k, r: f"prompt={len(r[0])}")
+    _tr("cache fetch", S.LRUPromptCache, "fetch_nearest_cache", info=lambda a, k, r: f"prompt={len(a[2])} reuse={len(a[2]) - len(r[1])}")
+    _tr("cache insert", S.LRUPromptCache, "insert_cache", info=lambda a, k, r: f"tokens={len(a[2])} type={k.get('cache_type')}")
+    if os.environ.get("TP_TRACE") == "1": _tr("batch.next", G.BatchGenerator, "_next", lambda a, k, r: f"prompt_resp={len(r[0])} gen_resp={len(r[1])} cur={[sum(len(x) for x in q[0]) for q in a[0]._currently_processing]}")
     _tr("extract_cache", G.BatchGenerator, "extract_cache")
     _tr("remove", G.BatchGenerator, "remove")
     _tr("prompt()", G.PromptProcessingBatch, "prompt")
