@@ -285,7 +285,8 @@ MLX's waiting between GPU and CPU and not in the RDMA layer. Not found yet: a mo
 any weights (`experiments/hopwave.py`: two chains of matrix products with a CPU hop after each step) hides the
 hop at every size, and in the real pipeline the collapse goes away when any one of the three layer types is
 removed (halves of 1,792 rows: 22% faster than plain without sparse attention, 11% without linear attention,
-10% without the MLPs, 24% slower with all three). So it is not one layer's code path. Two things the loop needs, both
+10% without the MLPs, 24% slower with all three). So it is not one layer's code path. The queue depth (1 to 8
+half-steps) and MLX's per-buffer size limit make no difference either. Two things the loop needs, both
 measured: no `mx.clear_cache()` between half-steps (25% slower with it, every buffer is allocated afresh), and
 no blocking wait right before encoding the next half-step (the GPU idles about 8 ms each time); it queues ahead
 and waits only for the step queued three earlier. Shipping it means blocks of 3,072 tokens in a server whose
