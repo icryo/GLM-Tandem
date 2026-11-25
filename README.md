@@ -116,8 +116,9 @@ request (many do by default) never saw the numbers above this table.
   `finalize()` on a cache slot this model never fills, and padding through the linear-attention state is unverified.
 - **Seeded requests do not share decode steps by default** (`TP_SEEDED=1`), so several seeded jobs at once are
   no faster in total than one after another. `TP_SEEDED=2` lets them share (129 instead of 97 tok/s at four
-  workers) but then the output for a seed is not exactly repeatable under overlap: logits are 16-bit, they round
-  differently with the batch shape, and near-ties fall the other way. Greedy requests show the same effect, so
+  workers) and is what `scripts/run-cluster.sh` sets since 2026-11-25, because the traffic it serves does not
+  need repeatable outputs. The price: the output for a seed is then not exactly repeatable under overlap: logits
+  are 16-bit, they round differently with the batch shape, and near-ties fall the other way. Greedy requests show the same effect, so
   `temperature=0` output also depends on what else is running. Greedy requests with a seed keep the stock path.
   What mode 1 costs in waiting, from one day of real traffic where every job carries a seed: a job that arrives
   while one other request is in flight takes 1.4–2.4 s longer than one that arrives alone, 3.4–5.3 s longer with
@@ -211,6 +212,81 @@ request (many do by default) never saw the numbers above this table.
     `bench/seedecho.py` checks that no request gets another's answer, `bench/seedwait.py` measures the wait behind
     a long prompt.
 
+18. **The hyper-connection post step rides behind the branch.** Each half-layer has a small compute-only kernel
+    (the Sinkhorn step, about 10 µs) whose result is only needed by the next half-layer. It used to be encoded in
+    front of the branch's first kernel. It is now attached to the partial result that enters the sum across the
+    Macs, so it is encoded after the branch's last, memory-bound kernel and runs beside it. Same values, one
+    extra dependency: 1.7% faster on two-row passes and 2.2% on three-row passes, byte-identical output at
+    temperature 0 (`TP_HC_ORDER=pre` restores the old order). Measured with `bench/fixed.py`: the same prompt at
+    temperature 0 gives the same token sequence every time, so two builds can be compared to about 0.2%
+    (140.1 against 142.5 tok/s, alternating starts); the prose benchmark above varies by more than the gain. On this GPU a compute-only kernel is free when
+    it is encoded after a memory-bound one and costly when encoded before it (`experiments/overlapbench.py`:
+    a 2 GiB sweep takes 2.75 ms, an arithmetic kernel 2.44 ms, sweep then arithmetic 2.47 ms together,
+    arithmetic then sweep 4.05 ms).
+
+## Where a pass goes
+
+Measured on 2026-11-25 by taking one component out at a time (`experiments/tpmtp_x.py`, `ABLATE=...`), with the
+next input fed back inside the graph so no host read is in the way. One pass with two rows (the verified token
+and one draft) at short context takes 11.7 ms on each Mac; one row takes 8.9 ms and three take 14.3 ms, so a pass
+is about 6.1 ms plus 2.75 ms per row.
+
+| Part of a two-row pass | ms | Of which reading weights at the bus limit |
+|---|---|---|
+| Expert layers: router, gate/up and down kernels (42 layers, 120 MB per layer and Mac) | 5.2 | 4.4 |
+| Linear attention (34 layers, 38 MB each) | 1.6 | 1.1 |
+| Sparse attention (11 layers) | 1.1 | 0.2 |
+| Sums across the two Macs (90 per pass) | 1.1 | – |
+| Hyper-connection chain, vocabulary head, embedding | 1.7 | 0.15 |
+| Dense MLPs of the first three layers, and what the removals do not add up to | 1.0 | – |
+
+- **The reading kernels are close to the hardware.** Each Mac reads about 7.2 GB per two-row pass. The expert
+  kernels move 120 MB in 124 µs inside the running pipeline, close to 1,000 GB/s; the highest raw streaming rate
+  published for this chip is about 1,150 GB/s. Reading everything at that rate would take 6.3 ms of the 11.7.
+- **The rest is spread thin.** About 4 ms is not reading: the sums (1.1 ms: 0.5 for the GPU→CPU→GPU hop, 0.65
+  for the network and waiting for the other Mac), the hyper-connection step in front of every half-layer
+  (about 0.8), the sparse-attention chain (0.9), kernel starts and the router in the expert layers (0.8).
+  No single item is worth more than a few percent, and steps cannot be merged freely: a threadgroup runs on
+  one GPU core at about 27 GB/s, so anything that needs a result reduced across threadgroups stays its own kernel.
+- **Sparse attention is what grows with context.** Its 11 layers cost 1.4 ms per pass at 1k tokens, 2.1 ms at
+  20k, 2.8 ms at 59k and 3.1 ms at 141k (23% of the pass). The growth is the index: scoring every pooled key takes
+  35 µs per layer at 20k tokens and 124 µs at 141k, the top-k selection 28 and 48 µs, and both Macs compute the
+  same scores.
+- **The two Macs are not the same speed.** The one with the 64-core GPU is about 1.6% slower on a pass than the
+  one with 80 cores, whichever rank it has; kernels that are short on arithmetic are slightly slower on the
+  80-core GPU. Swapping the ranks changes nothing.
+- **Draft acceptance in real traffic is 75%** (12,000 requests, from the server's own counters): half of all
+  requests lie between 70 and 82%, and one in twenty reaches 90%. JSON jobs are no more predictable to this head
+  than prose, so more draft rows per pass would not pay.
+
+Reading a prompt (19k tokens in blocks of 2,048, about 2,700 tokens/s) divides differently: expert layers 37%,
+linear attention 20%, sparse attention 16%, and 17–20% for the sums across the Macs. Almost all of that last
+part is the CPU-side pass over the 16.8 MB each sum carries, with the GPUs idle meanwhile; the network adds
+close to nothing (a hop to the CPU and back without any network costs the same).
+
+**Prototype, not in the server: reading two half-blocks interleaved** (`wf_forward` in `experiments/tpmtp_x.py`).
+A block is split in two halves that walk the layers alternately, half-layer by half-layer, so the sum for one
+half is in flight while the GPUs compute the other half. Per layer the order stays first half, then second half,
+so every cache sees the rows in order: the result is bit-identical to reading the two halves one after the other
+(all 101 cache arrays and the last hidden state, in every configuration tried).
+
+| Reading 16,384 tokens | tokens/s |
+|---|---|
+| Plain, blocks of 2,048 (the server today) | 2,714 |
+| Plain, blocks of 1,536 / 1,024 | 2,604 / 2,400 |
+| Interleaved, two halves of 1,024 | 2,799 |
+| Interleaved, two halves of 1,536 | 2,994 (+10% over today) |
+| Interleaved, two halves of 1,792 or more | about 2,000 |
+| Plain 2,048 with the sums removed (the ceiling for this idea) | 3,257 |
+
+Halves larger than 1,536 rows fall apart: the GPU then sits idle for about 6 ms before each kernel that
+consumes a sum, also when the sum is replaced by a hop to the CPU and back with no network, so the cause is in
+MLX's waiting between GPU and CPU and not in the RDMA layer. Not found yet. Two things the loop needs, both
+measured: no `mx.clear_cache()` between half-steps (25% slower with it, every buffer is allocated afresh), and
+no blocking wait right before encoding the next half-step (the GPU idles about 8 ms each time); it queues ahead
+and waits only for the step queued three earlier. Shipping it means blocks of 3,072 tokens in a server whose
+scheduler, image pins and async image reads all count in 2,048-token blocks, so it has not been merged.
+
 ## Staying up
 
 - **Vision memory is bounded.** The tower's attention is global over an image's patches; at the processor's
@@ -250,11 +326,13 @@ request (many do by default) never saw the numbers above this table.
   35-second restart. `gateway/hold-and-retry.diff` (against our aiohttp gateway, not part of this repo) makes it
   hold new requests until the server answers again and send a request once more when its connection failed
   before any answer. Against a stand-in upstream that is killed mid-run (`gateway/fake_upstream.py`,
-  `gateway/client.py`): 9 of 10 requests fail before, none after.
+  `gateway/client.py`): 9 of 10 requests fail before, none after. On the live service (`bench/gwretry.py`: a
+  request every two seconds, alternating streaming and plain, while the model server is killed once): 35 of 35
+  answered correctly, and the 16 that arrived during the restart waited 1–31 s for it instead of failing.
 
 ## What did not help
 
-All measured on this setup; the code for the first two is in `experiments/`.
+All measured on this setup; the code for the first two and for the router experiment is in `experiments/`.
 
 - Fusing sparse attention into one kernel (`sarows.py`): correct, slower. One threadgroup runs on about one GPU core.
 - A tensor-unit kernel for the expert layers (`tuqmv.py`): slower.
@@ -275,19 +353,31 @@ All measured on this setup; the code for the first two is in `experiments/`.
   the round trip, not the megabyte of payload.
 - The two-row vocabulary-head kernel for three and four rows: prose 140 instead of 142 tok/s, two streams 161
   instead of 169.
-- Letting the hyper-connection post kernel run without its ordering dependency: 140 against 142 tok/s.
+- Letting the hyper-connection post kernel run without any ordering dependency: 140 against 142 tok/s. Tying it
+  to the end of the branch instead is what helps ("What makes it fast" 18).
 - Capping MLX's buffer pool: the pool stayed under 35 GiB through every failure; the memory that ran out was live
   (see the padded batch caches under Known problems).
+- Folding the expert router into the hyper-connection kernel in front of it (`experiments/hcrows_x_exp.py`,
+  `TP_HC_ROUTER=1`): the logits are bit-identical in all 42 layers and one kernel per expert layer disappears,
+  but prose falls from 142.5 to 129.9 tok/s. The router matrix is 2.4 MB and the one threadgroup that holds the
+  normalized vector reads it on one GPU core.
+- Queuing the sparse layers' index upkeep behind the same layer's expert kernels (`TP_SIDE=1`): no change, it
+  already overlapped.
+- oMLX's other decode path for sparse attention (tensor-unit index scores, fused selection, gathered attention):
+  15.4 ms per pass instead of 12.4 at 19k tokens, 16.0 instead of 13.2 at 141k.
+- Running rank 0 on the Mac with the 80-core GPU: 11.75 ms per pass either way, and the same prompt speed.
+- Reading prompts in blocks of 4,096 or 1,024 tokens instead of 2,048: 2,283 and 2,383 tokens/s against 2,690.
+  Every block reads all expert weights once per layer, which is what smaller blocks pay for.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `server/` | `tpserve.py` (the server) and the kernel modules it loads |
-| `scripts/` | `run-cluster.sh` (launcher), `pyx` (oMLX's Python with the patched MLX first on the path) |
+| `scripts/` | `run-cluster.sh` (launcher), `pyx` (oMLX's Python with the patched MLX first on the path), `servex.sh` and `runx.sh` (start the server or the harness on both Macs by hand, without copying anything over the installed files) |
 | `mlx/` | The MLX patch and how to build it |
 | `bench/` | Benchmarks and correctness checks |
-| `experiments/` | Negative results kept for reference |
+| `experiments/` | Negative results kept for reference, the measurement harness (`tpmtp_x.py`: removal switches, per-kernel profile of plain passes, prompt-reading budget) and the interleaved prompt-reading prototype |
 | `gateway/` | A patch for a proxy in front of the server (hold and retry while the server restarts) and its stand-in test |
 
 ## Running it

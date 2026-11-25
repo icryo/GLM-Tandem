@@ -9,8 +9,34 @@
 import sys
 import mlx.core as mx
 
-STATS = {"layers": 0, "fallback": 0}
+STATS = {"layers": 0, "fallback": 0, "hop": 0, "late": 0}
 ENABLED = [True]
+
+# Where the HC post kernel (compute-only, ~10 us) is encoded. "pre": before the branch, as before 2026-11-25.
+# "hop" (default): after the branch's last kernel, attached to the partial that enters the cross-Mac sum, so it
+# runs beside that memory-bound kernel instead of in front of the branch's first one. Same values either way
+# (only a dependency is added): +1.75% decode, +2.2% on three-row cycles. The server's all_sum wrapper calls
+# take_pending(); anything still pending after a branch is attached to the branch output (_late).
+import os
+ORDER = os.environ.get("TP_HC_ORDER", "hop")
+PEND = []
+
+
+def take_pending(x):
+    """Make the partial entering the cross-Mac sum depend on the pending HC post output."""
+    if PEND:
+        STATS["hop"] += 1
+        x = mx.depends(x, PEND[:])
+        PEND.clear()
+    return x
+
+
+def _late(r):
+    if PEND:
+        STATS["late"] += 1
+        r = mx.depends(r, PEND[:])
+        PEND.clear()
+    return r
 
 
 def _rep(src, old, new, count=None):
@@ -113,7 +139,10 @@ def install(layers, verbose=False):
             output_shapes=[(1, R, 4), (1, R, 4, 4), (R * 4 * D,)],
             output_dtypes=[mx.float32, mx.float32, mx.float32],
         )
-        xn = mx.depends(xn, [po])
+        if ORDER == "hop":
+            PEND.append(po)
+        else:
+            xn = mx.depends(xn, [po])
         return xn, h, po, comb, mm
 
     class HCD(list):
@@ -139,7 +168,7 @@ def install(layers, verbose=False):
 
     def ffn_rows(self, y, residual, post, comb, mm):
         xn, h, post, comb, mm = hc_pre(self.ffn_hc, self.post_attention_layernorm, HCD(y, residual, post, comb, mm))
-        return self.mlp(xn), h, post, comb, mm
+        return _late(self.mlp(xn)), h, post, comb, mm
 
     def covered(self, x):
         if isinstance(x, HCD):
@@ -174,6 +203,7 @@ def install(layers, verbose=False):
             r = self.self_attn(xn, mask, cache, gdn_sink=gdn_sink)
         else:
             r = self.self_attn(xn, mask, cache)
+        r = _late(r)
         key = (r.shape, r.dtype)
         seen = self.__dict__.setdefault("_tp_ffn_seen", set())
         if not self.compile_ffn or key not in seen:
@@ -190,6 +220,7 @@ def install(layers, verbose=False):
 
     cls.__call__ = __call__
     cls._tp_hcrows = True
+    sys.modules["tp_hcrows_active"] = sys.modules[__name__]      # the server's all_sum wrapper looks this up
     for i, layer in enumerate(layers):
         layer.__dict__["_tp_trunk"] = True
         layer.__dict__["_tp_last"] = i + 1 == len(layers)

@@ -19,6 +19,8 @@ if float(os.environ.get("TP_WATCHDOG_S", "150")) > 0:
 g = mx.distributed.init(strict=True, backend=os.environ.get("TP_BACKEND", "jaccl"))
 _all_sum = mx.distributed.all_sum
 def all_sum(x, *args, **kwargs):
+    _hx = sys.modules.get("tp_hcrows_active")           # hcrows: a pending HC post output rides on this partial
+    if _hx is not None and _hx.PEND: x = _hx.take_pending(x)
     y = _all_sum(x, *args, **kwargs)
     if kwargs.get("stream") is not None or (len(args) > 1 and args[1] is not None):
         return y
