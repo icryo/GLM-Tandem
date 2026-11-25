@@ -281,7 +281,11 @@ so every cache sees the rows in order: the result is bit-identical to reading th
 
 Halves larger than 1,536 rows fall apart: the GPU then sits idle for about 6 ms before each kernel that
 consumes a sum, also when the sum is replaced by a hop to the CPU and back with no network, so the cause is in
-MLX's waiting between GPU and CPU and not in the RDMA layer. Not found yet. Two things the loop needs, both
+MLX's waiting between GPU and CPU and not in the RDMA layer. Not found yet: a model of the pattern without
+any weights (`experiments/hopwave.py`: two chains of matrix products with a CPU hop after each step) hides the
+hop at every size, and in the real pipeline the collapse goes away when any one of the three layer types is
+removed (halves of 1,792 rows: 22% faster than plain without sparse attention, 11% without linear attention,
+10% without the MLPs, 24% slower with all three). So it is not one layer's code path. Two things the loop needs, both
 measured: no `mx.clear_cache()` between half-steps (25% slower with it, every buffer is allocated afresh), and
 no blocking wait right before encoding the next half-step (the GPU idles about 8 ms each time); it queues ahead
 and waits only for the step queued three earlier. Shipping it means blocks of 3,072 tokens in a server whose
