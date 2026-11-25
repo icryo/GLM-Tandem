@@ -123,7 +123,8 @@ request (many do by default) never saw the numbers above this table.
   What mode 1 costs in waiting, from one day of real traffic where every job carries a seed: a job that arrives
   while one other request is in flight takes 1.4–2.4 s longer than one that arrives alone, 3.4–5.3 s longer with
   two or more in flight (a quarter of all job seconds), and a stream's first token comes after 4.5 s instead of
-  1.0 s (medians). Two defects that only showed in mode 2 are fixed: the `TP_BATCH_SLOTS` memory rule was
+  1.0 s (medians). For a tool-calling stream the first delta leaves when the call is complete, so that
+  figure includes generation (see "Where a request's time goes"). Two defects that only showed in mode 2 are fixed: the `TP_BATCH_SLOTS` memory rule was
   enforced by the mode-1 hand-over line and was silently off in mode 2, and a `stop` string could end the
   server (see "Staying up").
 - **Long context costs a flat 7 ms per pass at 195k tokens** (12 ms per pass at short context), whatever the number of rows.
@@ -291,6 +292,45 @@ measured: no `mx.clear_cache()` between half-steps (25% slower with it, every bu
 no blocking wait right before encoding the next half-step (the GPU idles about 8 ms each time); it queues ahead
 and waits only for the step queued three earlier. Shipping it means blocks of 3,072 tokens in a server whose
 scheduler, image pins and async image reads all count in 2,048-token blocks, so it has not been merged.
+
+## Where a request's time goes
+
+Measured 2026-11-25 on twelve hours of real traffic (Nov 24 13:15 to Nov 25 01:30, when seeded jobs still
+decoded alone), by joining the gateway's request log with the model server's own counters
+(`bench/turnsplit.py`, `bench/jobsplit.py`, `bench/smallread.py`, `bench/stepagg.py`; sizes and timings only).
+
+| Share of request seconds | Agent turns (906 streamed turns, prompt median 110k tokens) | Image jobs (2,134) |
+|---|---|---|
+| Decoding, at the speed of a request that runs alone | 46% (125 tok/s) | 49% (144 tok/s) |
+| Slower because other requests were in flight | 28% | 25% |
+| Reading the prompt | 13% | 16% |
+| Image tower | 1% | 6% |
+| Tokenize step | 3.5% | 1% |
+| Fixed per request (0.35 s per agent turn, 0.1 s per job) | 7% | 3% |
+
+- **The gateway's first-token time is not waiting time for a tool-calling stream.** The server sends a delta
+  only for text, reasoning or a complete tool call, so on 80% of agent turns most of the output already exists
+  when the first delta leaves. Read as waiting, that time looked like 83% of all stream seconds; split with the
+  server's counters, prompt work is 18% and the rest is generation.
+- **Re-reading is no longer a large item.** The server read 1.97 M prompt tokens in these turns; about 0.9 M of
+  them had been read before (roughly 380 s of 4,300), most of it in a dozen turns, several of which followed a
+  restart. Typical turns read little: median 118 tokens, 90th percentile 851.
+- **Overlap was the largest avoidable item.** With a job in flight an agent stream produced 50 tok/s over the
+  turn instead of 125; a job next to one other request 50 tok/s instead of 144, next to two or more 20. Only 2%
+  of all output tokens were decoded in shared steps. `TP_SEEDED=2` (live since 2026-11-25) lets seeded jobs
+  share steps; its effect on this split has not been measured on real traffic yet. The first shared steps
+  after the change ran 192 tok/s in total (24.2 ms per step for about 2.5 streams, 4.6 tokens per step)
+  against 150 tok/s for one stream on the same morning.
+- **A prompt read has a floor.** On long conversations a read of 1–24 tokens takes about 120 ms, 48–96 tokens
+  220 ms, 100–400 tokens 290–310 ms, the first and the hundredth time alike. For jobs the read time fits
+  146 ms + 0.31 ms per token (887 tokens in 425 ms, 2,020 in 781 ms, 3,152 in 1,143 ms). Long reads run
+  2,420–2,440 tokens/s above 60k tokens of context and 2,810 below.
+- **The tokenize step of a conversation that holds images** takes 136 ms per turn up to 120k tokens, 186 ms at
+  120–160k and 245 ms above 200k: the stock step decodes and preprocesses every image of the prompt on every
+  turn and encodes the whole text, around the incremental tokenizer. A memo for both gives identical tokens,
+  image positions, cache keys and pixel values in an offline test (`bench/vistoktest.py`: 320 turns, prompts
+  up to 202k tokens, 47–56 ms to 9 ms per turn without a new image on its synthetic conversations). It is in
+  `experiments/tokenize-memo.diff` and not live.
 
 ## Staying up
 
