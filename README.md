@@ -331,6 +331,12 @@ decoded alone), by joining the gateway's request log with the model server's own
   image positions, cache keys and pixel values in an offline test (`bench/vistoktest.py`: 320 turns, prompts
   up to 202k tokens, 47–56 ms to 9 ms per turn without a new image on its synthetic conversations). It is in
   `experiments/tokenize-memo.diff` and not live.
+- **Images come back.** Of 11,057 image parts in these twelve hours, 75% were among the last 64 distinct images
+  seen (58% for jobs alone; `bench/imgreuse.py`, hashes only). The image tower runs again whenever such an
+  image follows a changed prefix: a job that sends it after different text, and each turn on which an agent
+  client drops its oldest image and the four it keeps are read again. The same diff remembers the tower's
+  output per image; the logic is checked offline with a stand-in tower (identical embeddings, 422 tower calls
+  down to 26 in one run), the real tower has not run with it yet.
 
 ## Staying up
 

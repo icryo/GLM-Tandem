@@ -48,6 +48,21 @@ def run(proc, msgs, tools, new):
     t = time.perf_counter()
     out = S.ResponseGenerator._tokenize(me, tok, req, NS(chat_template_kwargs=None))
     return out, 1e3 * (time.perf_counter() - t)
+# Embedding splice with a stand-in tower (the real one needs the GPU): features are a fixed function of the
+# pixel values, so a remembered feature must equal a recomputed one, and the splice must not depend on the memo.
+HID = 8; calls = [0]
+def fake_tower(p, g):
+    calls[0] += 1
+    gg = [int(v) for v in np.array(g).reshape(-1)]
+    count = int(np.prod(gg) // ip.merge_size ** 2)
+    v = p.astype(mx.float32).reshape(count, -1)
+    return v.mean(axis=1, keepdims=True) + v[:, :1] * mx.arange(HID)[None].astype(mx.float32) * 0.01
+table = mx.random.normal((hf.vocab_size + 4096, HID)) if hasattr(hf, "vocab_size") else None
+img_id = tok.convert_tokens_to_ids("<|image|>")
+fake_model = NS(language_model=NS(model=NS(embed_tokens=lambda t: table[t])))
+embed_memo, fmemo = TV.make_embed(fake_tower, mx.float32, img_id, cap=int(os.environ.get("FEAT_CAP", str(64 << 20))))
+embed_plain, _ = TV.make_embed(fake_tower, mx.float32, img_id, cap=0)
+emb_bad = 0; emb_n = 0; tower_plain = tower_memo = 0
 rnd = random.Random(int(os.environ.get("SEED", "1")))
 WORDS = [w.strip() for w in open("/usr/share/dict/words") if w.strip().isalpha() and 3 < len(w.strip()) < 10][::37]
 EXTRA = ["<|user|>", "<think>", "</think>", "naïve café 日本語 🙂", "\n\n", "<tool_call>", "{\"a\": [1, 2]}", "<|observation|>"]
@@ -95,6 +110,18 @@ for step in range(STEPS):
             got = TV._pixels(vw.pixel_values)
             for (pa, ga), (pb, gb) in zip(vo.pixel_values, got):
                 if ga != gb or pa.shape != pb.shape or pa.dtype != pb.dtype or not np.array_equal(np.array(pa), np.array(pb)): ok = False
+    if ok and vo is not None and vo.starts:
+        # as the server does it: read from a cached prefix that ends before one of the images, or from the start
+        prompt = list(o[0]); cuts = [0] + [st_ for st_ in vo.starts] + [len(prompt) - 1]
+        for done in {0, rnd.choice(cuts), vo.starts[-1]}:
+            end = len(prompt) - 1
+            if done >= end: continue
+            nb = sum(i < done for i in vo.starts)
+            toks = mx.array(prompt[done:end])
+            c0 = calls[0]; e_old = embed_plain(fake_model, toks, pixel_values=vo.pixel_values[nb:]); tower_plain += calls[0] - c0
+            c0 = calls[0]; e_new = embed_memo(fake_model, toks, pixel_values=vw.pixel_values[nb:]); tower_memo += calls[0] - c0
+            emb_n += 1
+            if e_old.shape != e_new.shape or not np.array_equal(np.array(e_old), np.array(e_new)): emb_bad += 1; ok = False
     bad += not ok; maxtok = max(maxtok, len(o[0]))
     if not ok: print(f"step {step}: MISMATCH (prompt {len(o[0])} vs {len(w[0])})", flush=True)
     # the model answers: a tool call and its result, like an agent turn
@@ -102,4 +129,5 @@ for step in range(STEPS):
     msgs.append({"role": "tool", "tool_call_id": f"c{step}", "content": words(rnd.randrange(20, GROW))})
 print(f"{n} turns, mismatches {bad}, longest prompt {maxtok} tokens, images per prompt avg {imgs_total / max(n, 1):.1f}, remembered {hits} of {imgs_total} ({len(memo)} in memo)")
 print(f"tokenize step per turn: stock {t_old / n:.1f} ms, memoized {t_new / n:.1f} ms; turns without a new image ({nwarm}): stock {t_old_warm / max(nwarm, 1):.1f} ms, memoized {t_new_warm / max(nwarm, 1):.1f} ms")
+print(f"embedding splice: {emb_n} reads compared, mismatches {emb_bad}; tower calls without memo {tower_plain}, with memo {tower_memo} ({len(fmemo)} images remembered)")
 print("PASS" if bad == 0 else "FAIL")
