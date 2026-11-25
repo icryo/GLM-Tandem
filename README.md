@@ -189,7 +189,9 @@ request (many do by default) never saw the numbers above this table.
     system prompt twice more (125 ms at 195k tokens). A role marker is a special token, so the tokens before one
     do not depend on what follows: the common prefix with the previous turn's text is cut at the last role marker,
     its tokens are reused and only the rest is encoded (4 ms). `bench/tokmemotest.py` checks it against a full
-    encode on randomised conversations; `TP_TOKMEMO_CHECK=1` checks every live request.
+    encode on randomised conversations; `TP_TOKMEMO_CHECK=1` checks every live request. A conversation that
+    holds an image reached the tokenizer by another route and went around this until Nov 25 (see "Where a
+    request's time goes").
 14. **The lookup index is kept between turns** and its first build is one numpy pass (44 ms per turn before).
 15. **Cache entries are chosen, not just aged.** Earlier checkpoints of the same conversation are thinned to one per
     12% of its length, answer-end entries that can no longer match are dropped, and system-prompt checkpoints are
@@ -325,18 +327,24 @@ decoded alone), by joining the gateway's request log with the model server's own
   220 ms, 100–400 tokens 290–310 ms, the first and the hundredth time alike. For jobs the read time fits
   146 ms + 0.31 ms per token (887 tokens in 425 ms, 2,020 in 781 ms, 3,152 in 1,143 ms). Long reads run
   2,420–2,440 tokens/s above 60k tokens of context and 2,810 below.
-- **The tokenize step of a conversation that holds images** takes 136 ms per turn up to 120k tokens, 186 ms at
-  120–160k and 245 ms above 200k: the stock step decodes and preprocesses every image of the prompt on every
-  turn and encodes the whole text, around the incremental tokenizer. A memo for both gives identical tokens,
-  image positions, cache keys and pixel values in an offline test (`bench/vistoktest.py`: 320 turns, prompts
-  up to 202k tokens, 47–56 ms to 9 ms per turn without a new image on its synthetic conversations). It is in
-  `experiments/tokenize-memo.diff` and not live.
+- **The tokenize step of a conversation that holds images** took 136 ms per turn up to 120k tokens, 186 ms at
+  120–160k and 245 ms above 200k: the stock step decoded and preprocessed every image of the prompt on every
+  turn and encoded the whole text, around the incremental tokenizer. Since Nov 25 both are remembered
+  (`TP_TOKMEMO_ENC`, `TP_IMG_MEMO`; set either to 0 for the stock step): the text goes through the incremental
+  tokenizer, an image's token count and patch grid are kept per image, and its pixels are only made when the
+  tower asks for them. Tokens, image positions, cache keys and pixel values are identical in
+  `bench/vistoktest.py` (320 turns, prompts up to 202k tokens). On the server, a 59k-token conversation with
+  five images went from 56–60 ms per turn to under 20 ms.
 - **Images come back.** Of 11,057 image parts in these twelve hours, 75% were among the last 64 distinct images
-  seen (58% for jobs alone; `bench/imgreuse.py`, hashes only). The image tower runs again whenever such an
-  image follows a changed prefix: a job that sends it after different text, and each turn on which an agent
-  client drops its oldest image and the four it keeps are read again. The same diff remembers the tower's
-  output per image; the logic is checked offline with a stand-in tower (identical embeddings, 422 tower calls
-  down to 26 in one run), the real tower has not run with it yet.
+  seen (58% for jobs alone; `bench/imgreuse.py`, hashes only). The image tower ran again whenever such an
+  image followed a changed prefix: a job that sends it after different text, and each turn on which an agent
+  client drops its oldest image and the four it keeps are read again. Since Nov 25 the tower's output is
+  remembered per image (`TP_TOWER_MEMO_GB`, 2 GB of features by default, 0 = off). `bench/eqvis.py` sends a
+  fixed sequence at temperature 0 (the same image behind different text, three known images in a new order,
+  a 59k-token conversation that swaps its oldest image); run from a fresh start before and after, all 13
+  outputs are byte-identical. Tower time on the turns that re-read their five images fell from 544–647 ms to
+  6–293 ms (what is left is the one new image), those turns from 2.9–3.6 s to 2.3–3.2 s, and the request with
+  three known images from 1.68 to 1.17 s. A turn that only appends text gains the tokenize part alone.
 
 ## Staying up
 

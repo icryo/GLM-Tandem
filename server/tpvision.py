@@ -12,6 +12,127 @@ import mlx.core as mx
 _PLACEHOLDER = "<|tp_image_placeholder|>"
 
 
+class _LazyImage:
+    """An image the tokenize step asked for. It is decoded only if somebody needs it."""
+    __slots__ = ("url",)
+    def __init__(self, url): self.url = url
+
+
+class _Pixels:
+    """Pixel values of one image, produced when the tower asks for them."""
+    __slots__ = ("url", "val", "make")
+    def __init__(self, url, make, val=None): self.url = url; self.make = make; self.val = val
+    def get(self):
+        if self.val is None: self.val = self.make(self.url)
+        return self.val
+
+
+def _pixels(pixel_values):
+    return [p.get() if isinstance(p, _Pixels) else p for p in (pixel_values or [])]
+
+
+def make_embed(tower, dtype, image_token_id, cap=None):
+    """The model's embed_inputs: token embeddings with every image token replaced by its vision feature.
+
+    The tower's output for an image is remembered per image URL (TP_TOWER_MEMO_GB of features, default 2;
+    0 = off). An image comes back in front of a changed prefix often: a job that sends the same image after
+    different text (58% of the image parts of real jobs were among the last 64 images seen), and every turn
+    on which an agent client drops its oldest image re-reads the four it keeps. Each of those ran the tower
+    again, 60-280 ms per image, for a result that depends on the image alone."""
+    import collections
+    cap = int(float(os.environ.get("TP_TOWER_MEMO_GB", "2")) * 2**30) if cap is None else cap
+    memo = collections.OrderedDict(); used = [0]
+
+    def features(pixel_values, out_dtype):
+        feats = []
+        for pv in pixel_values:
+            url = pv.url if isinstance(pv, _Pixels) else None
+            f = memo.get(url) if (cap > 0 and url is not None) else None
+            if f is not None and f.dtype == out_dtype:
+                memo.move_to_end(url)
+            else:
+                p, g = pv.get() if isinstance(pv, _Pixels) else pv
+                f = tower(p.astype(dtype), mx.array([g])).astype(out_dtype)
+                mx.eval(f)
+                if cap > 0 and url is not None:
+                    old = memo.pop(url, None)
+                    if old is not None: used[0] -= old.nbytes
+                    memo[url] = f; used[0] += f.nbytes
+                    while used[0] > cap and len(memo) > 1:
+                        _, old = memo.popitem(last=False); used[0] -= old.nbytes
+            feats.append(f)
+        return feats
+
+    def embed_inputs(self, tokens, pixel_values=None):
+        """Token embeddings [T, H] with every image token replaced by its vision feature."""
+        emb = self.language_model.model.embed_tokens(tokens)
+        if not pixel_values:
+            return emb
+        feats = features(pixel_values, emb.dtype)
+        feats = mx.concatenate(feats, axis=0) if len(feats) > 1 else feats[0]
+        mask = tokens == image_token_id
+        n = int(mask.sum().item())
+        # Image rows already in the prompt cache (an image split by the cached prefix) keep the
+        # features that follow them aligned from the end.
+        lead = n - feats.shape[0]
+        if lead < 0:
+            feats = feats[-n:] if n else feats[:0]
+            lead = 0
+        if n == 0:
+            return emb
+        order = mx.cumsum(mask.astype(mx.int32)) - 1 - lead
+        use = mask & (order >= 0)
+        return mx.where(use[:, None], feats[mx.maximum(order, 0)], emb)
+
+    return embed_inputs, memo
+
+
+def make_processor(ip, decode, memo_n=None):
+    """Text expansion and pixel values for the images of a prompt.
+
+    A conversation sends its images again on every turn. The stock path decoded and preprocessed all of
+    them each time (20-25 ms per megapixel image; five images per turn of an agent conversation = about
+    100 ms before any GPU work), although an image inside the cached prefix only needs its token count.
+    The count and patch grid are remembered per image URL (a data URL, so the key is the image itself);
+    pixel values are made when the tower asks for them, which for a remembered image is normally never.
+    TP_IMG_MEMO=0 restores the stock behaviour, TP_IMG_MEMO_N sets how many images are remembered."""
+    import collections
+    on = os.environ.get("TP_IMG_MEMO", "1") == "1"
+    memo_n = int(os.environ.get("TP_IMG_MEMO_N", "64")) if memo_n is None else memo_n
+    memo = collections.OrderedDict()            # url -> (count, grid)
+
+    def make(url):
+        patches, grid = ip._process_one(decode(url))
+        return mx.array(patches), [int(g) for g in grid]
+
+    class Processor:
+        image_token = "<|image|>"
+
+        def __call__(self, text, images):
+            pixel_values = []
+            for image in images:
+                url = image.url if isinstance(image, _LazyImage) else None
+                hit = memo.get(url) if (on and url is not None) else None
+                if hit is not None:
+                    memo.move_to_end(url); count, grid = hit
+                    pv = _Pixels(url, make)
+                else:
+                    patches, grid = ip._process_one(decode(url) if url is not None else image)
+                    count = int(np.prod(grid) // ip.merge_size ** 2)
+                    grid = [int(g) for g in grid]
+                    pv = _Pixels(url, make, (mx.array(patches), grid))
+                    if on and url is not None:
+                        memo[url] = (count, grid)
+                        while len(memo) > memo_n: memo.popitem(last=False)
+                if self.image_token not in text:
+                    raise ValueError("More images were provided than image tokens.")
+                text = text.replace(self.image_token, _PLACEHOLDER * count, 1)
+                pixel_values.append(pv)
+            return text.replace(_PLACEHOLDER, self.image_token), pixel_values
+
+    return Processor(), memo
+
+
 def install(S, model, model_path, rank):
     from mlx_vlm.models.glm5_next import VisionConfig, VisionModel
     from mlx_vlm.models.glm5_next.processing import Glm5NextImageProcessor, _image_processor_kwargs
@@ -39,21 +160,11 @@ def install(S, model, model_path, rank):
     image_token_id = int(cfg["image_token_id"])
     ip = Glm5NextImageProcessor(**_image_processor_kwargs(model_path))
 
-    class Processor:
-        image_token = "<|image|>"
-
-        def __call__(self, text, images):
-            pixel_values = []
-            for image in images:
-                patches, grid = ip._process_one(image)
-                count = int(np.prod(grid) // ip.merge_size ** 2)
-                if self.image_token not in text:
-                    raise ValueError("More images were provided than image tokens.")
-                text = text.replace(self.image_token, _PLACEHOLDER * count, 1)
-                pixel_values.append((mx.array(patches), [int(g) for g in grid]))
-            return text.replace(_PLACEHOLDER, self.image_token), pixel_values
-
-    processor = Processor()
+    # The stock tokenize step decodes every image before it calls the processor: hand it a marker instead
+    # and decode inside the processor, only for images it has not seen (see make_processor).
+    _decode0 = S._decode_image
+    processor, _img_memo = make_processor(ip, _decode0)
+    S._decode_image = _LazyImage
     S.load_processor = lambda model, config: processor
 
     cls = type(model)
@@ -86,29 +197,7 @@ def install(S, model, model_path, rank):
             return _V.linear_forward(self.proj, o.transpose(0, 2, 1, 3).reshape(n, -1))
         _Att.__call__ = _att_call
 
-    def embed_inputs(self, tokens, pixel_values=None):
-        """Token embeddings [T, H] with every image token replaced by its vision feature."""
-        emb = self.language_model.model.embed_tokens(tokens)
-        if not pixel_values:
-            return emb
-        feats = []
-        for p, g in pixel_values:
-            f = tower(p.astype(dtype), mx.array([g])).astype(emb.dtype)
-            mx.eval(f); feats.append(f)
-        feats = mx.concatenate(feats, axis=0) if len(feats) > 1 else feats[0]
-        mask = tokens == image_token_id
-        n = int(mask.sum().item())
-        # Image rows already in the prompt cache (an image split by the cached prefix) keep the
-        # features that follow them aligned from the end.
-        lead = n - feats.shape[0]
-        if lead < 0:
-            feats = feats[-n:] if n else feats[:0]
-            lead = 0
-        if n == 0:
-            return emb
-        order = mx.cumsum(mask.astype(mx.int32)) - 1 - lead
-        use = mask & (order >= 0)
-        return mx.where(use[:, None], feats[mx.maximum(order, 0)], emb)
+    embed_inputs, _feat_memo = make_embed(tower, dtype, image_token_id)
 
     orig_call = cls.__call__
 

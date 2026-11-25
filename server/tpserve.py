@@ -2125,6 +2125,15 @@ if os.environ.get("TP_TOKMEMO", "1") == "1":
         if not isinstance(text, str): return _tw_act(self, *args, tokenize=True, **kwargs)
         return _tm_encode(self._tokenizer, text)
     _TWc.apply_chat_template = _tw_act2
+    # The image path renders the text itself and then calls tokenizer.encode(text) (stock _tokenize), which
+    # went around the memo above: a full encode on every turn of any conversation that holds an image,
+    # about 0.45 ms per 1,000 tokens (65-110 ms per turn at 150-250k tokens). Same memo, same check.
+    if os.environ.get("TP_TOKMEMO_ENC", "1") == "1":
+        def _tw_encode(self, text, *a, **k):
+            if not a and len(k) == 1 and k.get("add_special_tokens") is False and isinstance(text, str) and len(text) >= _TM_MIN:
+                return _tm_encode(self._tokenizer, text)
+            return self._tokenizer.encode(text, *a, **k)
+        _TWc.encode = _tw_encode
 
 # ---- Never hang (TP_WATCHDOG_S, default 150; 0 = off) -----------------------------------------------
 # Seen live: one rank failed a command buffer, the other waited for its sum forever; /health and
