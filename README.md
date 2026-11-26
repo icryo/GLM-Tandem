@@ -295,6 +295,34 @@ no blocking wait right before encoding the next half-step (the GPU idles about 8
 and waits only for the step queued three earlier. Shipping it means blocks of 3,072 tokens in a server whose
 scheduler, image pins and async image reads all count in 2,048-token blocks, so it has not been merged.
 
+## What the hardware is doing
+
+Read from macOS's own counters without sudo (`bench/ioreport.py`, a ctypes reader for IOReport; `bench/ioan.py`
+summarises a recording) over ten minutes of real traffic on 2026-11-25.
+
+- **No power setting holds anything back.** While a request runs both GPUs sit in their highest frequency state
+  (1,620 MHz, the last of 13 in the device tree), the memory interface in its highest state and the chip at its
+  overdrive voltage, with no thermal limit engaged.
+- **The memory bus is about half used.** The memory controller reports 256-320 GB/s of reads per die for most
+  of a decode (two dies per Mac, equal within 1%), so 510-640 GB/s per Mac of a nominal 1,229. The highest
+  value in any reporting interval was about 900 GB/s. This is the pass budget above seen from the hardware:
+  weights are read at close to the bus rate for about half of each pass.
+- **Waking the GPU is cheap.** Rank 0's GPU is powered off 59% of the time and starts each burst in its lowest
+  states; a wake-up loses 11 ms of compute at the median (26 ms at the 90th percentile). Rank 1's GPU never
+  sleeps: it waits for rank 0 inside a GPU spin, in the top state 94.5% of all time, drawing 8.7 W when idle
+  against 0.03 W.
+- **Idle time costs little.** Joined to the request log (`bench/idlegap.py`, sizes and timings only): a prompt
+  read of 300-900 tokens costs the same after any idle gap, a read of 900-3,000 tokens 27-31 ms more after two
+  seconds of idle or longer. The weights stay wired while idle (159 GiB).
+
+**Index scoring for long conversations, measured but not installed** (`experiments/idxblock2.py`). The kernel
+that scores pooled keys for the sparse layers is compute-bound and launches one small threadgroup per key and
+row. Scoring four keys per step from one load of the query values, with the verify rows sharing the key loads,
+gives the same bits and is 2.4 to 3 times faster on the 64-core GPU at 35,200 keys (a 141k-token
+conversation): 57 to 22.5 µs for one row, 115 to 40 for two, 170 to 57 for three. With 11 sparse layers that
+is about 0.7 ms of a 13.2 ms pass. Putting several keys in one threadgroup without sharing the loads changes
+nothing.
+
 ## Where a request's time goes
 
 Measured 2026-11-25 on twelve hours of real traffic (Nov 24 13:15 to Nov 25 01:30, when seeded jobs still
@@ -436,7 +464,7 @@ All measured on this setup; the code for the first two and for the router experi
 | `scripts/` | `run-cluster.sh` (launcher), `pyx` (oMLX's Python with the patched MLX first on the path), `servex.sh` and `runx.sh` (start the server or the harness on both Macs by hand, without copying anything over the installed files) |
 | `mlx/` | The MLX patch and how to build it |
 | `bench/` | Benchmarks and correctness checks |
-| `experiments/` | Negative results kept for reference, the measurement harness (`tpmtp_x.py`: removal switches, per-kernel profile of plain passes, prompt-reading budget) and the interleaved prompt-reading prototype |
+| `experiments/` | Negative results kept for reference, the measurement harness (`tpmtp_x.py`: removal switches, per-kernel profile of plain passes, prompt-reading budget), the interleaved prompt-reading prototype and the index-scoring variants (`idxblock.py`, `idxblock2.py`) |
 | `gateway/` | A patch for a proxy in front of the server (hold and retry while the server restarts) and its stand-in test |
 
 ## Running it
