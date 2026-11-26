@@ -348,9 +348,15 @@ decoded alone), by joining the gateway's request log with the model server's own
 - **Overlap was the largest avoidable item.** With a job in flight an agent stream produced 50 tok/s over the
   turn instead of 125; a job next to one other request 50 tok/s instead of 144, next to two or more 20. Only 2%
   of all output tokens were decoded in shared steps. `TP_SEEDED=2` (live since 2026-11-25) lets seeded jobs
-  share steps; its effect on this split has not been measured on real traffic yet. The first shared steps
-  after the change ran 192 tok/s in total (24.2 ms per step for about 2.5 streams, 4.6 tokens per step)
-  against 150 tok/s for one stream on the same morning.
+  share steps. Over the following ten hours of traffic (`bench/periods.py`, request log only; the mix is not
+  the same, job prompts were about twice as long) the output per request-second went from 54 to 68 tokens
+  for a job next to one other job, from 44 to 48 for a job next to a stream and from 40 to 50 for a stream
+  next to a job, with jobs that arrive alone unchanged at 101 and 102. A stream that arrives alone went from
+  58 to 70, which is the memos below and the kernel order above. 12% of output tokens were then decoded in
+  shared steps, at 151 tok/s in total and 26 ms per step, against 137 tok/s for one stream alone: a request
+  that shares steps still gets about half its speed alone and the pair a tenth more than one. Overlap is
+  still the largest avoidable item. One cause is known: a rejected draft row of one stream moves the padded
+  key buffers of the whole batch (24.8 ms per step after a clean step, 27.5 after a rejection).
 - **A prompt read has a floor.** On long conversations a read of 1–24 tokens takes about 120 ms, 48–96 tokens
   220 ms, 100–400 tokens 290–310 ms, the first and the hundredth time alike. For jobs the read time fits
   146 ms + 0.31 ms per token (887 tokens in 425 ms, 2,020 in 781 ms, 3,152 in 1,143 ms). Long reads run
