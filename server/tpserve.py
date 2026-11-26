@@ -18,9 +18,31 @@ if float(os.environ.get("TP_WATCHDOG_S", "150")) > 0:
     import threading; threading.Thread(target=_boot_wd, daemon=True).start()
 g = mx.distributed.init(strict=True, backend=os.environ.get("TP_BACKEND", "jaccl"))
 _all_sum = mx.distributed.all_sum
+# TP_NAX_RPE: rows per expert from which a sorted expert product of a prompt block takes oMLX's tile kernel instead of
+# one small product per (row, expert). oMLX's gate is 4 (blocks of 144 tokens and more). On this model's shapes the
+# tile kernel is already cheaper from about 1.33 rows per expert (48 tokens): 42 layers of expert work for a
+# 128-token block cost 199 ms on the per-row path and 135 ms on tiles (kern/floorbench2.py). Default 4 = unchanged.
+_RPE = float(os.environ.get("TP_NAX_RPE", "4"))
+if _RPE != 4:
+    try:
+        import omlx.patches.m5_gather_qmm as _GQ
+        _GQ._nax_rows_ok = lambda rows, w: rows >= 16 and w.ndim == 3 and rows >= _RPE * max(int(w.shape[0]), 1)
+        print(f"[tp] tile kernel for prompt experts from {_RPE} rows per expert", flush=True)
+    except Exception as e:
+        print(f"[tp] TP_NAX_RPE not applied: {type(e).__name__}: {e}", flush=True)
+# TP_GSUM_MIN > 0: partials with at least that many elements (prompt blocks) are exchanged with all_gather and added
+# on the GPU instead of being summed on the CPU inside all_sum (the CPU pass over a block's partial is what the
+# exchange costs while reading a prompt). Two ranks: a + b either way. Off by default.
+_GSUM = int(os.environ.get("TP_GSUM_MIN", "0"))
+_gsum_n = [0]
 def all_sum(x, *args, **kwargs):
     _hx = sys.modules.get("tp_hcrows_active")           # hcrows: a pending HC post output rides on this partial
     if _hx is not None and _hx.PEND: x = _hx.take_pending(x)
+    if _GSUM and not args and set(kwargs) <= {"group"} and isinstance(x, mx.array) and x.size >= _GSUM and (kwargs.get("group") or g).size() == 2:
+        both = mx.distributed.all_gather(mx.expand_dims(x, 0), group=kwargs.get("group"))
+        both = mx.squeeze(mx.expand_dims(both, 0), 0)
+        _gsum_n[0] += 1
+        return both[0] + both[1]
     y = _all_sum(x, *args, **kwargs)
     if kwargs.get("stream") is not None or (len(args) > 1 and args[1] is not None):
         return y
@@ -85,6 +107,16 @@ def _install_prefix(model):
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 maybe_apply_pre_load_patches(path, SimpleNamespace(mtp_enabled=True, mtp_fixed_depth=None, mtp_adaptive_max_depth=None) if MTP else None)
 import mlx_lm.server as S
+# TP_KVCAP=1: oMLX's capacity layout for BatchKVCache (mlx_lm and mlx_vlm): the key/value banks grow on a ratio ladder
+# inside a larger buffer instead of being copied on every 256-token step, merge, join and filter, and a ragged
+# rollback rolls rows in place. Only the cache methods; oMLX's batch row re-ordering on filter is NOT installed.
+if os.environ.get("TP_KVCAP", "0") == "1":
+    try:
+        from omlx.patches.vlm_batch_kv_capacity import install_capacity_methods as _icap, BatchKVCache as _VBK, LMBatchKVCache as _LBK
+        for _c in (_VBK, _LBK): _icap(_c)
+        print("[tp] KV capacity layout installed (mlx_lm + mlx_vlm BatchKVCache)", flush=True)
+    except Exception as e:
+        print(f"[tp] KV capacity layout not installed: {type(e).__name__}: {e}", flush=True)
 from omlx.cluster.progressive_loading import progressive_sharded_load
 # The draft head on both Macs, split like a trunk layer (stock: rank zero only, whole). Its attention
 # and expert layer then cost each rank half, and no rank waits idle while the other drafts.
@@ -141,6 +173,40 @@ def _sharded_load(repo, *args, **kwargs):
                 return base_make(self) + self.language_model.make_mtp_cache()
             cls.make_cache = make_cache
             _shared["lm"] = lm; _shared["nl"] = model._tp_nlayers
+    if lm is not None and os.environ.get("TP_OMLX_KEEP") is not None:
+        # Bisect tool (window only): import oMLX's scheduler, which replaces batch-generator and cache functions, then
+        # put back everything except the named groups: merge extend split prompt step kvcap (comma list, "" = none).
+        import importlib as _il
+        _G2, _LC, _VC = (_il.import_module(n) for n in ("mlx_lm.generate", "mlx_lm.models.cache", "mlx_vlm.models.cache"))
+        _keep = set(x for x in os.environ["TP_OMLX_KEEP"].split(",") if x)
+        _cls = [_G2.GenerationBatch, _G2.PromptProcessingBatch] + [getattr(m, n) for m in (_LC, _VC) for n in ("BatchKVCache", "KVCache", "RotatingKVCache", "ChunkedKVCache") if hasattr(m, n)]
+        _before = {c: dict(vars(c)) for c in _cls}; _gmod = {k: getattr(_G2, k) for k in ("_merge_caches", "_extend_cache")}
+        import omlx.scheduler  # noqa: F401
+        _groups = {"merge": [], "extend": [], "split": [(_G2.PromptProcessingBatch, "split")], "prompt": [(_G2.PromptProcessingBatch, "prompt")],
+                   "step": [(_G2.GenerationBatch, "_step"), (_G2.GenerationBatch, "filter")], "kvcap": []}
+        _kept = set(a for gname in _keep for a in _groups.get(gname, []))
+        for c in _cls:
+            if "kvcap" in _keep and c.__name__ == "BatchKVCache": continue
+            if "merge" in _keep and c.__name__ in ("KVCache", "RotatingKVCache"): continue      # singleton passthrough needs these
+            now = dict(vars(c))
+            for k, v in now.items():
+                if (c, k) in _kept or k.startswith("_omlx") and False: continue
+                if k not in _before[c]:
+                    try: delattr(c, k)
+                    except Exception: pass
+                elif _before[c][k] is not v:
+                    setattr(c, k, _before[c][k])
+        for k, v in _gmod.items():
+            if not (k == "_merge_caches" and "merge" in _keep) and not (k == "_extend_cache" and "extend" in _keep): setattr(_G2, k, v)
+        print(f"[r{R}] oMLX scheduler imported; kept only: {sorted(_keep) or 'nothing'}", flush=True)
+    if lm is not None and os.environ.get("TP_FUSE_GU", "0") in ("1", "import"):
+        try:
+            import time as _ftm
+            from omlx.patches.moe_gate_up_fusion import apply_switch_glu_gate_up_fusion as _fuse_gu
+            _ft = _ftm.time(); _fn = _fuse_gu(model) if os.environ.get("TP_FUSE_GU") == "1" else 0
+            print(f"[r{R}] gate/up projections fused in {_fn} expert layers ({_ftm.time() - _ft:.1f} s), active {mx.get_active_memory() / 2**30:.1f} GiB", flush=True)
+        except Exception as e:
+            print(f"[r{R}] gate/up fusion not applied: {type(e).__name__}: {e}", flush=True)
     if MTP and lm is not None and HCROWS:
         import hcrows
         print(f"[r{R}] fused HC rows: {hcrows.install(list(model.layers))}", flush=True)
@@ -150,6 +216,12 @@ def _sharded_load(repo, *args, **kwargs):
     if MTP and lm is not None and os.environ.get("TP_QMVROWS", "1") == "1":
         import qmvrows
         print(f"[r{R}] two-row vocabulary head kernel: {qmvrows.install()}", flush=True)
+    if lm is not None and os.environ.get("TP_IDXROWS", "1") == "1":
+        try:
+            import idxrows
+            print(f"[r{R}] {idxrows.install(list(model.layers))}", flush=True)
+        except Exception as e:
+            print(f"[r{R}] index scores not replaced: {type(e).__name__}: {e}", flush=True)
     if MTP and lm is not None: _install_prefix(model)
     if MTP and lm is not None: _install_multiseq(model)
     if lm is not None and os.environ.get("TP_VISION", "1") == "1":
@@ -2289,11 +2361,23 @@ try:
     mx.set_cache_limit(int(info["memory_size"]) if _pool is None else int(float(_pool) * 2**30))
 except Exception: pass
 if os.environ.get("TP_MEMLOG"):
+    def _os_pressure():
+        try:
+            import ctypes
+            v = ctypes.c_int(0); n = ctypes.c_size_t(4)
+            if ctypes.CDLL(None).sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(v), ctypes.byref(n), None, 0) == 0: return v.value
+        except Exception: pass
+        return -1
+    def _idx_note():
+        m = sys.modules.get("idxrows")
+        if m is None: return ""
+        st = m.STATS
+        return f" idx {st['single']}/{st['batched']}/{st['fallback']}" + (f" gsum {_gsum_n[0]}" if _GSUM else "")
     def _memlog():
         import time as _t
         while True:
             _t.sleep(float(os.environ["TP_MEMLOG"]))
-            try: print(f"[tp-mem r{g.rank()}] {_t.strftime('%H:%M:%S')} active {mx.get_active_memory() / 2**30:.1f} pool {mx.get_cache_memory() / 2**30:.1f} peak {mx.get_peak_memory() / 2**30:.1f} GiB", flush=True)
+            try: print(f"[tp-mem r{g.rank()}] {_t.strftime('%H:%M:%S')} active {mx.get_active_memory() / 2**30:.1f} pool {mx.get_cache_memory() / 2**30:.1f} peak {mx.get_peak_memory() / 2**30:.1f} GiB pressure {_os_pressure()}{_idx_note()}", flush=True)
             except Exception as e: print(f"[tp-mem] {e!r}", flush=True)
     import threading as _mth; _mth.Thread(target=_memlog, daemon=True).start()
 sys.argv = ["mlx_lm.server", "--model", path, "--host", "0.0.0.0", "--port", os.environ.get("TP_PORT", "8010"),

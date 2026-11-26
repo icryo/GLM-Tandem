@@ -26,7 +26,10 @@ PORT=$((48000 + RANDOM % 1000))
 # MLX_FENCE_MODE=1 needs the patched MLX build; remove it to run on stock MLX.
 # TP_CONC: requests decoded together. Prompts are processed one at a time (batched prompt processing crashes).
 # TP_SEEDED=2: requests that send a seed share decode steps with others (1 = they decode alone and repeat exactly).
-ENVS=(MODEL_PATH=$MODEL_PATH TP_CONC=8 TP_PROMPT_CONC=1 TP_SEEDED=2 MLX_FENCE_MODE=1 MLX_METAL_FAST_SYNCH=1
+# TP_OMLX_KEEP=merge,extend: a lone request keeps plain per-layer caches (oMLX's singleton passthrough), so its prompt
+# is read with causal attention instead of a batch cache with an explicit mask. TP_NAX_RPE=1.34: the tile kernel for
+# prompt experts from 48 tokens instead of 144.
+ENVS=(MODEL_PATH=$MODEL_PATH TP_CONC=8 TP_PROMPT_CONC=1 TP_SEEDED=2 TP_OMLX_KEEP=merge,extend TP_NAX_RPE=1.34 MLX_FENCE_MODE=1 MLX_METAL_FAST_SYNCH=1
       MLX_MAX_MB_PER_BUFFER=20000 MLX_MAX_OPS_PER_BUFFER=100000 MLX_WORLD_SIZE=2
       MLX_JACCL_COORDINATOR=$COORD_ADDR:$PORT MLX_IBV_DEVICES=$IBV_DEVICES)
 set +e

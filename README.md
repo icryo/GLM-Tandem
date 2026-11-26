@@ -11,6 +11,26 @@ with an OpenAI-style API.
 Model: uniform 4-bit (group 64) GLM-5.3-Flash with its MTP draft head, 169 GiB, half on each Mac.
 All rates are decode tokens/s as seen by a streaming client. "Prose" means fresh essays with little repetition.
 
+**Changes of 2026-11-26** (live since 04:49; fixed request sequences from fresh starts of the old and the new build,
+`bench/n26set.py`, `bench/n26perf.sh`)
+
+| | Before | After |
+|---|---|---|
+| Cold text prompt, 61k tokens | 2,314 tok/s | 2,842 tok/s |
+| Cold text prompt, 143k tokens | 2,335 tok/s | 2,734 tok/s |
+| Text prompt of 2,150 / 720 / 330 tokens (request with a short answer) | 1,137 / 446 / 309 ms | 861 / 397 / 278 ms |
+| Text prompt of 110–130 tokens | 308–354 ms | 230–232 ms |
+| Decode at 61k / 143k tokens of context | 126 / 117 | 129.5 / 122 |
+| A 70k conversation and a short request together (total) | 142 | 148–154 |
+| Agent-style turn at 120k, ~115 new tokens: first byte | 0.32 s | 0.25 s |
+| Short context, one stream / 2 / 8 streams | 142.5 / 172 / 231 | 142.3 / 168–169 / 226–229 |
+
+Three changes: index scoring with shared loads (`server/idxrows.py`, `TP_IDXROWS`, same bits), a lone request's
+prompt read into plain caches (`TP_OMLX_KEEP=merge,extend`) and the tile kernel for prompt experts from 48 tokens
+(`TP_NAX_RPE=1.34`). Short prompts and every image request give byte-identical output; long text prompts give
+different text after a few hundred characters, because their attention now takes the kernel image prompts already
+used. Details under "What the hardware is doing".
+
 **One request**
 
 | Workload | tok/s |
@@ -84,6 +104,10 @@ request (many do by default) never saw the numbers above this table.
 
 ## Known problems
 
+- **The plain-cache switch borrows oMLX's code by importing its scheduler and putting back everything else.**
+  `TP_OMLX_KEEP=merge,extend` imports `omlx.scheduler` (which replaces 23 batch-generator and cache functions when
+  imported) and restores all of them except the single-request cache passthrough. An oMLX upgrade can change what
+  that import does; `experiments/importdiff.py` lists what an import replaces. Set it to empty to turn it off.
 - **A long prompt and active streams share the machine about half and half.** The prompt loads at roughly half
   speed while streams decode at 35–45% of theirs (`TP_FAIR_MS`, `TP_FAIR_CHUNK`).
 - **Prompts are still read one at a time.** A short one jumps ahead of a long one (`TP_PREEMPT`), two long ones queue.
@@ -321,7 +345,23 @@ row. Scoring four keys per step from one load of the query values, with the veri
 gives the same bits and is 2.4 to 3 times faster on the 64-core GPU at 35,200 keys (a 141k-token
 conversation): 57 to 22.5 µs for one row, 115 to 40 for two, 170 to 57 for three. With 11 sparse layers that
 is about 0.7 ms of a 13.2 ms pass. Putting several keys in one threadgroup without sharing the loads changes
-nothing.
+nothing. Installed on 2026-11-26 as `server/idxrows.py` (it refuses to install if the vendored kernel text differs
+from the one it was derived from): bit-identical in 920 random cases and on every test request, decode at 143k
+tokens 117 to 122 tok/s.
+
+**Why a text prompt read slower than an image prompt.** A lone request's prompt went into the batch cache that
+mlx_lm builds for every request, and attention then ran with an explicit mask over the whole context. oMLX keeps a
+lone request's plain per-layer caches (its "singleton passthrough") and converts them only when a second request
+joins; the image path here already read that way, which is why a 59k-token image conversation read at about
+2,700 tokens/s while a text prompt of the same length read at 2,300. With the passthrough, text prompts read
+22% faster at 61k tokens and 15% faster at 143k. Found by accident: oMLX's gate/up fusion module imports its
+scheduler, and that import alone gave the gain. The fusion itself is bit-identical to separate projections at
+every size from 1 to 4,096 rows and is not faster (`experiments/fuseacc.py`, `experiments/moeacc.py`).
+
+**The floor of a prompt read.** For 144–288 tokens the expert layers cost 131–143 ms, because the tile kernel reads
+every expert's weights (0.68 GB per matrix per Mac) at about 620 GB/s. Below 144 tokens mlx switched to one small
+product per row and expert, which costs more from 48 tokens on (199 ms at 128 tokens; `experiments/floorbench2.py`).
+`TP_NAX_RPE=1.34` moves the switch to 48 tokens.
 
 ## Where a request's time goes
 
@@ -427,6 +467,15 @@ decoded alone), by joining the gateway's request log with the model server's own
 
 All measured on this setup; the code for the first two and for the router experiment is in `experiments/`.
 
+- Adding a prompt block's two partial sums on the GPU after an all_gather instead of on the CPU inside all_sum:
+  same bits, 2.8% slower prompt reading (the gather's copy costs more than the CPU add it saves).
+- oMLX's spare-capacity key/value banks (rolled in place on a rejected draft): same bits, no measurable gain next
+  to a long conversation, 1–2% slower with several short streams.
+- MLX 0.32.5 with this oMLX build: oMLX's compiled sparse-index extension does not load against it and falls back
+  to a slow path (decode at 143k 94 instead of 122 tok/s). Its new small-row matmul kernels are about twice as fast
+  at 4–16 rows in isolation (`experiments/opbench.py`), so it is worth another try once oMLX is rebuilt for it.
+- The reduced-precision fp32 matmul on the tensor units changes no expert choice here (router weights and inputs
+  are bf16).
 - Fusing sparse attention into one kernel (`sarows.py`): correct, slower. One threadgroup runs on about one GPU core.
 - A tensor-unit kernel for the expert layers (`tuqmv.py`): slower.
 - Skipping the fence's coherence kernel: faster, but corrupts output.
