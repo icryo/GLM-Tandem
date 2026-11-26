@@ -104,6 +104,13 @@ request (many do by default) never saw the numbers above this table.
 
 ## Known problems
 
+- **A shared step pays for rolled-back drafts with a copy of every key/value bank.** Profiled on 2026-11-26
+  (`MLX_KPROF`, `experiments/kpcmp.py`): a step of a 70k conversation and a short request, two tokens each,
+  costs about 9.7 ms of GPU work more than one stream's cycle. 6.9 ms of that is the extra rows themselves (expert
+  layers, projections, hyper-connections). About 2 ms is the rollback after a rejected draft: the batch cache
+  turns the rejected row into left padding by gathering the whole bank of every sparse layer, and the cost grows
+  with the context. Another 0.8 ms is per-step sampling noise made with small kernels. Two-token shared steps are
+  therefore off beyond 200k slots (`TP_MSPEC_SLOTS`). Removing the copy needs a cache layout with ragged ends.
 - **The plain-cache switch borrows oMLX's code by importing its scheduler and putting back everything else.**
   `TP_OMLX_KEEP=merge,extend` imports `omlx.scheduler` (which replaces 23 batch-generator and cache functions when
   imported) and restores all of them except the single-request cache passthrough. An oMLX upgrade can change what
