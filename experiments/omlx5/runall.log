@@ -1,0 +1,71 @@
+gate open: inflight=0 last_real_request_age_s=80
+== index fallback, MLX 0.32.4 (pyx)
+mlx 0.32.4.dev20261114+36969c0 | sparse_index native: True
+P= 14600 rows=1: fallback scores    19.9 us  argpartition top-512    26.5 us  native dsa_topk_indices     6.2 us (same set: True)
+P= 14600 rows=2: fallback scores    28.8 us  argpartition top-512    24.9 us  native dsa_topk_indices     6.2 us (same set: True)
+P= 14600 rows=4: fallback scores    47.4 us  argpartition top-512    38.0 us  native dsa_topk_indices     6.2 us (same set: True)
+P= 35200 rows=1: fallback scores    26.3 us  argpartition top-512    40.5 us  native dsa_topk_indices     6.1 us (same set: True)
+P= 35200 rows=2: fallback scores    40.8 us  argpartition top-512    42.6 us  native dsa_topk_indices     6.2 us (same set: True)
+P= 35200 rows=4: fallback scores    73.8 us  argpartition top-512    89.2 us  native dsa_topk_indices     6.5 us (same set: True)
+P= 50000 rows=1: fallback scores    31.0 us  argpartition top-512    43.0 us  native dsa_topk_indices     8.8 us (same set: True)
+P= 50000 rows=2: fallback scores    52.5 us  argpartition top-512    47.0 us  native dsa_topk_indices     6.4 us (same set: True)
+P= 50000 rows=4: fallback scores    97.9 us  argpartition top-512    90.1 us  native dsa_topk_indices     6.8 us (same set: True)
+gate open: inflight=0 last_real_request_age_s=81
+== index fallback, MLX 0.32.5 (pyx5)
+omlx.custom_kernels.sparse_index: native extension is present but failed to load; falling back to the slow path: dlopen(/Applications/oMLX.app/Contents/Resources/omlx/custom_kernels/sparse_index/_ext.cpython-311-darwin.so, 0x0002): Symbol not found: __ZN3mlx4core5metal6Device11get_libraryERKNSt3__112basic_stringIcNS3_11char_traitsIcEENS3_9allocatorIcEEEERKNS0_14CompileOptionsERKNS3_8functionIFS9_vEEE
+  Referenced from: <87A25FA0-58DC-3A86-B9DE-822801309C3D> /Applications/oMLX.app/Contents/Resources/omlx/custom_kernels/sparse_index/_ext.cpython-311-darwin.so
+  Expected in:     <6FEFE7AF-B6FF-3DDB-B5A8-2E13ED43940E> /Users/a/mlxbuild5/mlx/python/mlx/lib/libmlx.dylib
+mlx 0.32.5.dev20261125+cfc675e | sparse_index native: False
+P= 14600 rows=1: fallback scores    18.7 us  argpartition top-512    25.0 us
+P= 14600 rows=2: fallback scores    28.9 us  argpartition top-512    25.2 us
+P= 14600 rows=4: fallback scores    49.2 us  argpartition top-512    40.2 us
+P= 35200 rows=1: fallback scores    27.2 us  argpartition top-512    39.0 us
+P= 35200 rows=2: fallback scores    41.6 us  argpartition top-512    44.1 us
+P= 35200 rows=4: fallback scores    74.3 us  argpartition top-512    88.2 us
+P= 50000 rows=1: fallback scores    33.0 us  argpartition top-512    41.4 us
+P= 50000 rows=2: fallback scores    54.6 us  argpartition top-512    52.2 us
+P= 50000 rows=4: fallback scores    99.0 us  argpartition top-512    87.4 us
+gate open: inflight=0 last_real_request_age_s=83
+== quant_matmul, MLX 0.32.4 (pyx)
+mlx 0.32.4.dev20261114+36969c0 | affine_q4_qmm_t: True
+N= 4096 K=4096 rows= 128: ext     54.3 us  stock     51.4 us  ext==stock True (max diff 0.00e+00)
+N= 4096 K=4096 rows= 512: ext    172.2 us  stock    172.0 us  ext==stock True (max diff 0.00e+00)
+N= 4096 K=4096 rows=2048: ext    671.4 us  stock    667.8 us  ext==stock True (max diff 0.00e+00)
+Traceback (most recent call last):
+  File "/tmp/kbench_qmmcheck.py", line 34, in <module>
+    a, b = ext(), stock(); mx.eval(a, b)
+           ^^^^^
+  File "/tmp/kbench_qmmcheck.py", line 32, in <lambda>
+    ext = lambda: fast.affine_q4_qmm_t(x, wq, sc, bi, 8, 64)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Applications/oMLX.app/Contents/Resources/omlx/custom_kernels/quant_matmul/fast.py", line 254, in affine_q4_qmm_t
+    return _ext.affine_q4_qmm_t(
+           ^^^^^^^^^^^^^^^^^^^^^
+ValueError: [quant_matmul.affine_qmm_t] unsupported shape.
+gate open: inflight=0 last_real_request_age_s=84
+== quant_matmul, MLX 0.32.5 (pyx5)
+mlx 0.32.5.dev20261125+cfc675e | affine_q4_qmm_t: True
+N= 4096 K=4096 rows= 128: ext     54.2 us  stock    121.3 us  ext==stock False (max diff 7.81e-03)
+N= 4096 K=4096 rows= 512: ext    171.9 us  stock    151.3 us  ext==stock True (max diff 0.00e+00)
+N= 4096 K=4096 rows=2048: ext    662.9 us  stock    583.5 us  ext==stock True (max diff 0.00e+00)
+Traceback (most recent call last):
+  File "/tmp/kbench_qmmcheck.py", line 34, in <module>
+    a, b = ext(), stock(); mx.eval(a, b)
+           ^^^^^
+  File "/tmp/kbench_qmmcheck.py", line 32, in <lambda>
+    ext = lambda: fast.affine_q4_qmm_t(x, wq, sc, bi, 8, 64)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Applications/oMLX.app/Contents/Resources/omlx/custom_kernels/quant_matmul/fast.py", line 254, in affine_q4_qmm_t
+    return _ext.affine_q4_qmm_t(
+           ^^^^^^^^^^^^^^^^^^^^^
+ValueError: [quant_matmul.affine_qmm_t] unsupported shape.
+== compare saved outputs 0.32.4 vs 0.32.5
+Traceback (most recent call last):
+  File "/tmp/kbench_npzcmp.py", line 3, in <module>
+    a, b = np.load(sys.argv[1]), np.load(sys.argv[2])
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/Applications/oMLX.app/Contents/Resources/Python/framework-mlx-base/lib/python3.11/site-packages/numpy/lib/_npyio_impl.py", line 454, in load
+    fid = stack.enter_context(open(os.fspath(file), "rb"))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/kbench_qmm_0324.npz'
+ALL DONE

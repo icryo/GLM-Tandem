@@ -25,6 +25,11 @@ All rates are decode tokens/s as seen by a streaming client. "Prose" means fresh
 | Agent-style turn at 120k, ~115 new tokens: first byte | 0.32 s | 0.25 s |
 | Short context, one stream / 2 / 8 streams | 142.5 / 172 / 231 | 142.3 / 168–169 / 226–229 |
 
+Real traffic, 15.8 h before (Nov 25 10:57 -> Nov 26 02:45) against 13.6 h after (05:00 -> 18:50), different mix
+(holiday; `bench/srvperiods.py`, server counters only): text prompt reads of 1-4k tokens p50 1,697 -> 1,374 ms,
+single-stream decode 135.0 -> 138.7 tok/s token-weighted (2.38 -> 2.50 tok/cycle), shared runs 160.5 -> 161.1,
+image prompt reads unchanged.
+
 Three changes: index scoring with shared loads (`server/idxrows.py`, `TP_IDXROWS`, same bits), a lone request's
 prompt read into plain caches (`TP_OMLX_KEEP=merge,extend`) and the tile kernel for prompt experts from 48 tokens
 (`TP_NAX_RPE=1.34`). Short prompts and every image request give byte-identical output; long text prompts give
@@ -111,6 +116,14 @@ request (many do by default) never saw the numbers above this table.
   turns the rejected row into left padding by gathering the whole bank of every sparse layer, and the cost grows
   with the context. Another 0.8 ms is per-step sampling noise made with small kernels. Two-token shared steps are
   therefore off beyond 200k slots (`TP_MSPEC_SLOTS`). Removing the copy needs a cache layout with ragged ends.
+  Built offline on 2026-11-26 evening, not live: ragged key-cache ends (`experiments/n27/ragkv_x.py`,
+  `TP_RAGGED=1` in `experiments/n27/tpserve_n27_x.py`) forget a rejected row per stream instead of rolling; attention
+  output, logical keys and pools bit-identical over 6 seeds x 2,400 random steps; a rejecting step's rollback
+  5.9 -> ~0.5 ms at 70k+2k and 10.4 -> ~1.1 ms at 120k+2k. Needs a window (`experiments/n27/WINDOW.md`).
+- **MLX's buffer pool is not capped.** `mx.set_cache_limit` is the whole RAM unless `TP_MLX_CACHE_GB` is set, and the
+  pool is flushed only after prompt blocks of 1,024+ tokens (`TP_CLEAR_MIN`). After a run of small requests on
+  2026-11-26 18:41 rank 0 held 131.7 GiB active + 59.9 GiB pooled (191.6 GiB; the wired limit is 224.6 GiB); a
+  minute later the pool was back under 1 GiB. A cap (e.g. `TP_MLX_CACHE_GB=24`) needs a restart.
 - **The plain-cache switch borrows oMLX's code by importing its scheduler and putting back everything else.**
   `TP_OMLX_KEEP=merge,extend` imports `omlx.scheduler` (which replaces 23 batch-generator and cache functions when
   imported) and restores all of them except the single-request cache passthrough. An oMLX upgrade can change what
@@ -481,6 +494,18 @@ All measured on this setup; the code for the first two and for the router experi
 - MLX 0.32.5 with this oMLX build: oMLX's compiled sparse-index extension does not load against it and falls back
   to a slow path (decode at 143k 94 instead of 122 tok/s). Its new small-row matmul kernels are about twice as fast
   at 4–16 rows in isolation (`experiments/opbench.py`), so it is worth another try once oMLX is rebuilt for it.
+- MLX 0.32.5, follow-up: only oMLX's `sparse_index` extension fails (one symbol moved namespace), so it needs a
+  recompile against 0.32.5, no source change (`experiments/omlx5/README.md`); the build was not run.
+- A scale index for the decode expert kernels (`experiments/scaleidx/`): the checkpoint has only 250-550 distinct
+  (scale, bias) pairs per 131,072-group expert matrix (~450-550 per whole layer), so a uint16 index into a table is
+  exact (36 -> 34 bytes per 64 weights), but the extra lookup costs as much as the bytes save: same bits, 0% at
+  1-2 rows, 5-20% slower at 4-8 rows.
+- Cheaper weight unpacking in the prompt expert tiles (codes OR-ed into bf16 0x4300, scale and bias once per group;
+  `experiments/tilefill/`): ~25% more accurate against float64, but never faster than oMLX's tile kernel; unpacking
+  is only ~12% of expert time.
+- Moving the exchange into the GPU command stream (signal kernel, native poller thread, bounded spin-wait kernel;
+  `experiments/encx/`): the handshake alone costs +19 us per exchange against +4-6 us for MLX's hop with our fast
+  fence, and a spin without a system-scope fence per iteration misses host writes.
 - The reduced-precision fp32 matmul on the tensor units changes no expert choice here (router weights and inputs
   are bf16).
 - Fusing sparse attention into one kernel (`sarows.py`): correct, slower. One threadgroup runs on about one GPU core.
