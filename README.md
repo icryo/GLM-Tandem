@@ -120,6 +120,10 @@ request (many do by default) never saw the numbers above this table.
   `TP_RAGGED=1` in `experiments/n27/tpserve_n27_x.py`) forget a rejected row per stream instead of rolling; attention
   output, logical keys and pools bit-identical over 6 seeds x 2,400 random steps; a rejecting step's rollback
   5.9 -> ~0.5 ms at 70k+2k and 10.4 -> ~1.1 ms at 120k+2k. Needs a window (`experiments/n27/WINDOW.md`).
+- **MLX 0.32.4 (ours) has the reshape-after-transpose bug fixed in 0.32.5 (#4915)**, and our vision tower's
+  Conv3d (3 -> 1,024 channels) matches its trigger. Checked on 2026-11-26 (`experiments/vis4915.py`): the PR's repro
+  shows the bug on our build (max error 79.8), but the tower is not affected: patch embedding bit-identical GPU vs CPU,
+  whole tower in float32 with `MLX_ENABLE_TF32=0` within 1.4e-5 relative RMS (cosine 1.0000 on every row).
 - **MLX's buffer pool is not capped.** `mx.set_cache_limit` is the whole RAM unless `TP_MLX_CACHE_GB` is set, and the
   pool is flushed only after prompt blocks of 1,024+ tokens (`TP_CLEAR_MIN`). After a run of small requests on
   2026-11-26 18:41 rank 0 held 131.7 GiB active + 59.9 GiB pooled (191.6 GiB; the wired limit is 224.6 GiB); a
